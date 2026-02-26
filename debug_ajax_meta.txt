@@ -1,0 +1,9 @@
+status: 200
+headers:
+Server: nginx/1.15.7
+Date: Thu, 26 Feb 2026 07:03:32 GMT
+Content-Type: text/html; charset=UTF-8
+Content-Length: 0
+Connection: keep-alive
+X-Powered-By: PHP/5.5.15
+raw_bytes: 0

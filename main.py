@@ -1,10 +1,12 @@
 import sys
 import json
 import re
+import html
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import urllib.parse
 import requests
+from requests import Session
 from bs4 import BeautifulSoup
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -19,6 +21,36 @@ from PySide6.QtGui import QTextCursor
 
 SOURCES_FILE = "sources.json"
 BASE_URL = "https://raspisanie.rusoil.net/rasp_old/"
+
+# Общая сессия для поддержания cookies/referer, как в браузере
+SESSION = Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+})
+
+WEEKDAY_ORDER = {
+    "Пн": 1,
+    "Пн.": 1,
+    "Понедельник": 1,
+    "Вт": 2,
+    "Вт.": 2,
+    "Вторник": 2,
+    "Ср": 3,
+    "Ср.": 3,
+    "Среда": 3,
+    "Чт": 4,
+    "Чт.": 4,
+    "Четверг": 4,
+    "Пт": 5,
+    "Пт.": 5,
+    "Пятница": 5,
+    "Сб": 6,
+    "Сб.": 6,
+    "Суббота": 6,
+    "Вс": 7,
+    "Вс.": 7,
+    "Воскресенье": 7,
+}
 
 @dataclass
 class Lesson:
@@ -36,6 +68,11 @@ class Source:
     query: str
     priority: int
     enabled: bool
+    filial: int = 1
+    kaf: Optional[int] = None
+    kaf_name: str = ""
+    kid: Optional[int] = None
+    vak: Optional[int] = None
 
 def load_sources():
     try:
@@ -50,11 +87,41 @@ def save_sources(sources):
         json.dump([asdict(s) for s in sources], f, indent=4, ensure_ascii=False)
 
 def build_url(source: Source):
-    q = urllib.parse.quote_plus(source.query)
+    """
+    Строит URL для получения расписания.
+    - Для групп: index.php?gruppa=...
+    - Для преподавателей:
+        * если известны kid/vak и кафедра — как в showbegunokprep (Ajaxm.js)
+        * иначе старый поиск по фамилии.
+    """
     if source.search_type == "group":
+        q = urllib.parse.quote_plus(source.query)
         return f"{BASE_URL}index.php?gruppa={q}&sem=0"
-    else:
-        return f"{BASE_URL}index.php?family={q}&sem=0"
+
+    # Преподаватель
+    # Если в источнике сохранены реальные идентификаторы с сайта
+    if source.kaf and (source.kid or source.vak):
+        filial = source.filial or 1
+        kaf = source.kaf
+        family = urllib.parse.quote(source.query or "", encoding="utf-8")
+        kafedra = urllib.parse.quote(source.kaf_name or "", encoding="utf-8")
+        if source.kid:
+            # Не вакансия
+            return (
+                f"{BASE_URL}index.php?"
+                f"kid={source.kid}&vak=0&family={family}"
+                f"&kaf={kaf}&kafedra={kafedra}&sem=0&filial={filial}"
+            )
+        # Вакансия
+        return (
+            f"{BASE_URL}index.php?"
+            f"kid=0&vak={source.vak}&family={family}"
+            f"&kaf={kaf}&kafedra={kafedra}&sem=0&filial={filial}"
+        )
+
+    # Fallback: поиск по фамилии, как раньше
+    q = urllib.parse.quote_plus(source.query)
+    return f"{BASE_URL}index.php?family={q}&sem=0"
 
 
 def _decode_schedule_html(raw: bytes) -> str:
@@ -66,6 +133,26 @@ def _decode_schedule_html(raw: bytes) -> str:
                 return text
         except (UnicodeDecodeError, LookupError):
             continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _decode_ajax_html(raw: bytes) -> str:
+    """Декодирует ответы Ajaxm.php (списки кафедр и преподавателей).
+
+    Сайт иногда отвечает в utf-8, иногда в cp1251. Раньше мы ориентировались по
+    фрагментам start008/start006, но в некоторых ответах их может не быть и мы
+    получали кривой текст (особенно в случае докторских списков). Поэтому теперь
+    смотрим просто на наличие кириллицы, а не только на служебные токены.
+    """
+    for enc in ("utf-8", "cp1251"):
+        try:
+            text = raw.decode(enc)
+            # при удачном декоде либо есть кириллица, либо служебный маркер
+            if re.search(r"[А-Яа-я]", text) or "start008" in text or "start006" in text:
+                return text
+        except (UnicodeDecodeError, LookupError):
+            continue
+    # ничего не подошло, просто прогоняем через utf-8 с заменой, чтобы не падать
     return raw.decode("utf-8", errors="replace")
 
 
@@ -251,50 +338,377 @@ class ConflictDialog(QDialog):
 class AddSourceDialog(QDialog):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Добавить источник")
-        self.resize(400, 260)
+        self.setWindowTitle("Добавить группу")
+        self.resize(400, 200)
         layout = QFormLayout()
 
-        self.type_box = QComboBox()
-        self.type_box.addItems(["Группа", "Преподаватель"])
-        self.type_box.currentTextChanged.connect(self._on_type_changed)
-
         self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("Отображаемое название")
+        self.name_input.setPlaceholderText("Например: БНИ-23-01")
         self.query_input = QLineEdit()
-        self.query_input.setPlaceholderText("Например: БНИ-23-01 или Иванов И.И.")
+        self.query_input.setPlaceholderText("Код группы с сайта, например БНИ-23-01")
         self.priority_input = QSpinBox()
         self.priority_input.setRange(1, 100)
         self.priority_input.setValue(10)
         self.priority_input.setToolTip("Больше — выше приоритет при конфликтах")
 
-        layout.addRow("Тип поиска:", self.type_box)
-        layout.addRow("Название:", self.name_input)
-        self.query_label = QLabel("Группа:")
-        layout.addRow(self.query_label, self.query_input)
+        layout.addRow("Название группы:", self.name_input)
+        layout.addRow("Код группы:", self.query_input)
         layout.addRow("Приоритет:", self.priority_input)
 
         btn = QPushButton("Добавить")
         btn.clicked.connect(self.accept)
         layout.addRow(btn)
         self.setLayout(layout)
-        self._on_type_changed(self.type_box.currentText())
-
-    def _on_type_changed(self, text):
-        if "Преподаватель" in text:
-            self.query_label.setText("ФИО преподавателя:")
-        else:
-            self.query_label.setText("Группа:")
-
     def get_source(self):
-        st = "teacher" if "Преподаватель" in self.type_box.currentText() else "group"
         return Source(
             name=self.name_input.text().strip() or self.query_input.text().strip(),
-            search_type=st,
+            search_type="group",
             query=self.query_input.text().strip(),
             priority=self.priority_input.value(),
             enabled=True,
         )
+
+
+class AddTeacherSourceDialog(QDialog):
+    """Добавление преподавателя через реальные списки с сайта (как в браузере)."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Добавить преподавателя")
+        self.resize(500, 300)
+
+        self._result_source: Optional[Source] = None
+
+        layout = QFormLayout(self)
+
+        # --- Филиал ---
+        self.filial_box = QComboBox()
+        self.filial_box.addItem("Уфа", 1)
+        layout.addRow("Филиал:", self.filial_box)
+
+        # --- Кафедры ---
+        self.kaf_box = QComboBox()
+        self.kaf_box.setEnabled(False)
+
+        self.load_kaf_btn = QPushButton("Загрузить кафедры")
+        self.load_kaf_btn.clicked.connect(self.load_kafedras)
+
+        layout.addRow(self.load_kaf_btn)
+        layout.addRow("Кафедра:", self.kaf_box)
+
+        # --- Преподаватели ---
+        self.teacher_box = QComboBox()
+        self.teacher_box.setEnabled(False)
+
+        self.load_teacher_btn = QPushButton("Загрузить преподавателей")
+        self.load_teacher_btn.clicked.connect(self.load_teachers)
+
+        layout.addRow(self.load_teacher_btn)
+        layout.addRow("Преподаватель:", self.teacher_box)
+
+        # --- Приоритет ---
+        self.priority_input = QSpinBox()
+        self.priority_input.setRange(1, 100)
+        self.priority_input.setValue(10)
+        layout.addRow("Приоритет:", self.priority_input)
+
+        # --- Кнопка ---
+        btn = QPushButton("Добавить")
+        btn.clicked.connect(self.accept)
+        layout.addRow(btn)
+
+    # --------------------------------------------------
+
+    def _post_ajax(self, payload: str) -> str:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": f"{BASE_URL}index.php",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://raspisanie.rusoil.net",
+            "Host": "raspisanie.rusoil.net",
+        }
+
+        # Попытка отправить как cp1251 (как в старых реалиях сайта), затем как utf-8.
+        # Сервер иногда возвращает неконсистентный HTML, поэтому пытаемся несколько вариантов.
+        last_exc = None
+        last_text = None
+        last_status = None
+        last_headers = None
+        last_raw = None
+
+        # Попытка получить стартовые куки/стейт как делает браузер
+        try:
+            SESSION.get(f"{BASE_URL}index.php", timeout=8)
+        except Exception:
+            pass
+
+        # Сначала попробуем отправить как строку (requests сам закодирует),
+        # затем как cp1251 и utf-8 (байты) — иногда сервер ожидает конкретную кодировку.
+        for enc in (None, "cp1251", "utf-8"):
+            try:
+                if enc is None:
+                    data_to_send = payload
+                    hdrs = headers.copy()
+                    hdrs.pop("Content-Type", None)
+                    hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+                else:
+                    data_to_send = payload.encode(enc, errors="ignore")
+                    hdrs = headers.copy()
+                    hdrs["Content-Type"] = f"application/x-www-form-urlencoded; charset={ 'windows-1251' if enc=='cp1251' else 'utf-8' }"
+
+                r = SESSION.post(
+                    f"{BASE_URL}Ajaxm.php",
+                    data=data_to_send,
+                    headers=hdrs,
+                    timeout=15,
+                    allow_redirects=True,
+                )
+                last_raw = r.content
+                last_status = getattr(r, "status_code", None)
+                last_headers = dict(getattr(r, "headers", {}) or {})
+                text = _decode_ajax_html(r.content)
+                last_text = text
+                # Если в ответе есть ожидаемые маркеры или селект — считаем успехом
+                if ("start006" in text) or ("start008" in text) or ("<select" in text.lower()):
+                    return text
+            except Exception as e:
+                last_exc = e
+
+        # Если ответ пустой (например Content-Length: 0), попробуем сначала инициировать сессию ещё раз
+        if last_raw is None or len(last_raw) == 0:
+            try:
+                SESSION.get(f"{BASE_URL}index.php", timeout=8)
+                # Повторный POST (строка)
+                r = SESSION.post(f"{BASE_URL}Ajaxm.php", data=payload, headers=headers, timeout=15)
+                last_raw = r.content
+                last_status = getattr(r, "status_code", None)
+                last_headers = dict(getattr(r, "headers", {}) or {})
+                last_text = _decode_ajax_html(r.content)
+            except Exception:
+                pass
+
+        # Если ни один вариант не дал ожидаемых маркеров, но есть последний текст —
+        # сохраним расширенную отладочную информацию и вернём текст для дальнейшей попытки парсинга.
+        if last_text is not None:
+            # Если в ответе нет привычных маркеров, сохраним файлы для диагностики.
+            if not ("start006" in last_text or "start008" in last_text or "<select" in last_text.lower()):
+                try:
+                    with open("debug_ajax_response.html", "w", encoding="utf-8") as f:
+                        f.write(last_text or "")
+                    with open("debug_ajax_meta.txt", "w", encoding="utf-8") as f:
+                        f.write(f"status: {last_status}\n")
+                        f.write("headers:\n")
+                        for k, v in (last_headers or {}).items():
+                            f.write(f"{k}: {v}\n")
+                        f.write(f"raw_bytes: {len(last_raw) if last_raw is not None else 'None'}\n")
+                except Exception:
+                    pass
+            return last_text
+
+        # Если ничего не получилось — попробуем финальный POST и пробросим исключение
+        try:
+            r = SESSION.post(f"{BASE_URL}Ajaxm.php", data=payload.encode("utf-8", errors="ignore"), headers=headers, timeout=15)
+            return _decode_ajax_html(r.content)
+        except Exception:
+            if last_exc:
+                raise last_exc
+            raise
+
+    # --------------------------------------------------
+
+    def load_kafedras(self):
+        """Получает список кафедр напрямую из HTML index.php и заполняет kaf_box."""
+        self.kaf_box.clear()
+        self.teacher_box.clear()
+        self.teacher_box.setEnabled(False)
+
+        filial = int(self.filial_box.currentData() or 1)
+
+        # Пытаемся загрузить страницу, на которой уже содержится select с кафедрами.
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                "Referer": f"{BASE_URL}index.php",
+            }
+            r = requests.get(f"{BASE_URL}index.php?filial={filial}", headers=headers, timeout=15)
+            r.raise_for_status()
+            page_html = _decode_ajax_html(r.content)
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось получить страницу с кафедрами:\n{e}")
+            return
+
+        raw = html.unescape(page_html)
+        soup = BeautifulSoup(raw, "html.parser")
+        # элемент, в который вставляется <select id="rfio" или блок slov_kafedr
+        select = soup.find("select", id="rfio")
+        if not select:
+            select = soup.find("select", id=lambda v: v and "rfio" in v.lower())
+        container = None
+        if select and not select.find_all("option"):
+            # возможно select самозакрывается; возьмём опции из родительского контейнера
+            container = select.parent
+        if not select:
+            # окончательное усилие: просто любой <select> в контейнере slov_kafedr
+            container = soup.find(id="slov_kafedr")
+            if container:
+                select = container.find("select")
+        # если нашли контейнер, соберём options из него вместо select
+        options = []
+        if container:
+            options = container.find_all("option")
+        elif select:
+            options = select.find_all("option")
+        if not options:
+            try:
+                with open("debug_kafedr_response.html", "w", encoding="utf-8") as f:
+                    f.write(raw)
+            except Exception:
+                pass
+            QMessageBox.critical(self, "Ошибка", "Не удалось найти элемент с кафедрами на странице. Ответ записан в debug_kafedr_response.html")
+            return
+
+        for opt in options:
+            value = opt.get("value")
+            # use space separator so that newlines/<br> don't glue words together
+            title = opt.get_text(separator=" ", strip=True)
+            # текст может оказаться в неправильной кодировке (declare UTF-8, но на деле cp1251 bytes)
+            try:
+                # re-encode through latin1 to preserve raw bytes
+                title = title.encode("latin1").decode("cp1251")
+            except Exception:
+                pass
+            if not value or value == "0":
+                continue
+            try:
+                kaf_id = int(value)
+            except ValueError:
+                continue
+            self.kaf_box.addItem(title, kaf_id)
+
+        if self.kaf_box.count() == 0:
+            QMessageBox.warning(self, "Пусто", "Кафедры не найдены на странице.")
+            return
+        self.kaf_box.setEnabled(True)
+    # --------------------------------------------------
+
+    def load_teachers(self):
+        """Получает список преподавателей для выбранной кафедры, используя index.php?kaf=..."""
+        self.teacher_box.clear()
+
+        if not self.kaf_box.currentData():
+            QMessageBox.warning(self, "Ошибка", "Выберите кафедру.")
+            return
+
+        filial = int(self.filial_box.currentData() or 1)
+        kaf_id = int(self.kaf_box.currentData())
+
+        # Загрузим страницу для кафедры
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                "Referer": f"{BASE_URL}index.php",
+            }
+            r = requests.get(f"{BASE_URL}index.php?kaf={kaf_id}&filial={filial}", headers=headers, timeout=15)
+            r.raise_for_status()
+            page_html = _decode_ajax_html(r.content)
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось получить страницу преподавателей:\n{e}")
+            return
+
+        raw = html.unescape(page_html)
+        soup = BeautifulSoup(raw, "html.parser")
+        select = soup.find("select", id="kadrvak")
+        if not select:
+            # иногда id может отсутствовать, ищем любой <select> с opt value содержащим '@'
+            candidates = soup.find_all("select")
+            for cand in candidates:
+                opts = cand.find_all("option")
+                for o in opts:
+                    if "@" in (o.get("value") or ""):
+                        select = cand
+                        break
+                if select:
+                    break
+        container = None
+        options = []
+        if select:
+            options = select.find_all("option")
+            if not options:
+                container = select.parent
+        if container:
+            options = container.find_all("option")
+        if not options:
+            QMessageBox.critical(self, "Ошибка", "Не удалось найти список преподавателей на странице.")
+            return
+
+        for opt in options:
+            value = opt.get("value") or ""
+            # ensure spaces between fragments so names don't run together
+            fio = opt.get_text(separator=" ", strip=True)
+            # same encoding fix
+            try:
+                fio = fio.encode("latin1").decode("cp1251")
+            except Exception:
+                pass
+            if value == "0" or not fio:
+                continue
+            parts = value.split("@")
+            if len(parts) < 2:
+                continue
+            try:
+                vak_flag = int(parts[0])
+                tid = int(parts[1])
+            except ValueError:
+                continue
+            self.teacher_box.addItem(fio, (vak_flag, tid))
+
+        if self.teacher_box.count() == 0:
+            QMessageBox.warning(self, "Пусто", "Преподаватели не найдены на странице.")
+            return
+        self.teacher_box.setEnabled(True)
+
+
+    # --------------------------------------------------
+
+    def accept(self):
+        if not self.teacher_box.currentData():
+            QMessageBox.warning(self, "Ошибка", "Выберите преподавателя.")
+            return
+
+        filial = int(self.filial_box.currentData() or 1)
+        kaf_id = int(self.kaf_box.currentData())
+        kaf_name = self.kaf_box.currentText()
+
+        vak_flag, tid = self.teacher_box.currentData()
+        fio = self.teacher_box.currentText()
+
+        kid = tid if vak_flag == 0 else None
+        vak = tid if vak_flag == 1 else None
+
+        self._result_source = Source(
+            name=f"{fio} ({kaf_name})",
+            search_type="teacher",
+            query=fio,
+            priority=self.priority_input.value(),
+            enabled=True,
+            filial=filial,
+            kaf=kaf_id,
+            kaf_name=kaf_name,
+            kid=kid,
+            vak=vak,
+        )
+
+        super().accept()
+
+    def get_source(self) -> Optional[Source]:
+        return self._result_source
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -371,7 +785,16 @@ class MainWindow(QMainWindow):
     def display_schedule(self, lessons, conflicts, logs):
         self.list_widget.clear()
         if lessons:
-            for lesson in sorted(lessons, key=lambda x: (x.date, x.pair)):
+            def sort_key(lesson: Lesson):
+                day = (lesson.date or "").strip()
+                day_key = WEEKDAY_ORDER.get(day, 99)
+                try:
+                    pair_num = int(lesson.pair)
+                except (TypeError, ValueError):
+                    pair_num = 99
+                return (day_key, pair_num, lesson.discipline)
+
+            for lesson in sorted(lessons, key=sort_key):
                 self.list_widget.addItem(
                     f"{lesson.date} | Пара {lesson.pair} | {lesson.discipline} ({lesson.type}) — {lesson.owner}"
                 )
@@ -407,17 +830,23 @@ class MainWindow(QMainWindow):
         self.sources_list = QListWidget()
         self.sources_list.itemChanged.connect(self.on_source_changed)
         sources_layout.addWidget(self.sources_list, stretch=2)
+
         btn_layout = QVBoxLayout()
-        add_btn = QPushButton("Добавить")
-        add_btn.clicked.connect(self.add_source)
+        add_group_btn = QPushButton("Добавить группу")
+        add_group_btn.clicked.connect(self.add_group_source)
+        add_teacher_btn = QPushButton("Добавить преподавателя")
+        add_teacher_btn.clicked.connect(self.add_teacher_source)
         del_btn = QPushButton("Удалить")
         del_btn.clicked.connect(self.delete_source)
         save_btn = QPushButton("Сохранить")
         save_btn.clicked.connect(lambda: save_sources(self.sources))
-        btn_layout.addWidget(add_btn)
+
+        btn_layout.addWidget(add_group_btn)
+        btn_layout.addWidget(add_teacher_btn)
         btn_layout.addWidget(del_btn)
         btn_layout.addWidget(save_btn)
         btn_layout.addStretch()
+
         sources_layout.addLayout(btn_layout)
         layout.addLayout(sources_layout)
         self.refresh_sources()
@@ -436,6 +865,24 @@ class MainWindow(QMainWindow):
             item.setData(Qt.UserRole, idx)
             self.sources_list.addItem(item)
         self.sources_list.blockSignals(False)
+
+    def add_group_source(self):
+        dlg = AddSourceDialog()
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_source = dlg.get_source()
+            if new_source and new_source.query:
+                self.sources.append(new_source)
+                save_sources(self.sources)
+                self.refresh_sources()
+
+    def add_teacher_source(self):
+        dlg = AddTeacherSourceDialog()
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_source = dlg.get_source()
+            if new_source is not None:
+                self.sources.append(new_source)
+                save_sources(self.sources)
+                self.refresh_sources()
 
     def on_source_changed(self, item):
         idx = item.data(Qt.UserRole)

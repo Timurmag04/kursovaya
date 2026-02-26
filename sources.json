@@ -4,27 +4,35 @@
         "search_type": "group",
         "query": "БНИ-22-01",
         "priority": 10,
-        "enabled": false
+        "enabled": false,
+        "filial": 1,
+        "kaf": null,
+        "kaf_name": "",
+        "kid": null,
+        "vak": null
     },
     {
         "name": "БНИ-23-01",
         "search_type": "group",
         "query": "БНИ-23-01",
         "priority": 10,
-        "enabled": false
+        "enabled": false,
+        "filial": 1,
+        "kaf": null,
+        "kaf_name": "",
+        "kid": null,
+        "vak": null
     },
     {
         "name": "БИФ-22-01",
         "search_type": "group",
         "query": "БИФ-22-01",
         "priority": 8,
-        "enabled": false
-    },
-    {
-        "name": "Ремизов А.Л",
-        "search_type": "teacher",
-        "query": "Ремизов А.Л",
-        "priority": 10,
-        "enabled": true
+        "enabled": false,
+        "filial": 1,
+        "kaf": null,
+        "kaf_name": "",
+        "kid": null,
+        "vak": null
     }
 ]
