@@ -1,0 +1,30 @@
+[
+    {
+        "name": "БНИ-22-01",
+        "search_type": "group",
+        "query": "БНИ-22-01",
+        "priority": 10,
+        "enabled": false
+    },
+    {
+        "name": "БНИ-23-01",
+        "search_type": "group",
+        "query": "БНИ-23-01",
+        "priority": 10,
+        "enabled": false
+    },
+    {
+        "name": "БИФ-22-01",
+        "search_type": "group",
+        "query": "БИФ-22-01",
+        "priority": 8,
+        "enabled": false
+    },
+    {
+        "name": "Ремизов А.Л",
+        "search_type": "teacher",
+        "query": "Ремизов А.Л",
+        "priority": 10,
+        "enabled": true
+    }
+]
