@@ -4,7 +4,7 @@
         "search_type": "group",
         "query": "БНИ-22-01",
         "priority": 10,
-        "enabled": false,
+        "enabled": true,
         "filial": 1,
         "kaf": null,
         "kaf_name": "",
@@ -33,6 +33,18 @@
         "kaf": null,
         "kaf_name": "",
         "kid": null,
+        "vak": null
+    },
+    {
+        "name": "Биккулов А.С. (ИТМ)",
+        "search_type": "teacher",
+        "query": "Биккулов А.С.",
+        "priority": 10,
+        "enabled": false,
+        "filial": 1,
+        "kaf": 84,
+        "kaf_name": "ИТМ",
+        "kid": 32428,
         "vak": null
     }
 ]

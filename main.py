@@ -168,7 +168,25 @@ def _fetch_page(url: str, source: Source, use_post: bool) -> Tuple[str, int]:
         if source.search_type == "group":
             data["gruppa"] = source.query
         else:
-            data["family"] = source.query
+            # Для преподавателя: если есть kid/vak, используем их вместе с другими параметрами
+            if source.kid or source.vak:
+                if source.kid:
+                    data["kid"] = str(source.kid)
+                    data["vak"] = "0"
+                else:
+                    data["kid"] = "0"
+                    data["vak"] = str(source.vak)
+                # Добавляем другие необходимые параметры для полного запроса
+                data["family"] = source.query
+                if source.kaf:
+                    data["kaf"] = str(source.kaf)
+                if source.kaf_name:
+                    data["kafedra"] = source.kaf_name
+                if source.filial:
+                    data["filial"] = str(source.filial)
+            else:
+                # Fallback: по фамилии
+                data["family"] = source.query
         r = requests.post(url, data=data, timeout=15, headers=headers)
     else:
         r = requests.get(url, timeout=15, headers=headers)
@@ -176,9 +194,14 @@ def _fetch_page(url: str, source: Source, use_post: bool) -> Tuple[str, int]:
     return html, r.status_code
 
 def _parse_schedule_table(soup: BeautifulSoup, source: Source):
-    """Парсит таблицу расписания: День недели | Пара 1-7 | ячейка с несколькими занятиями."""
+    """Парсит таблицу расписания: поддерживает оба формата.
+    
+    Формат 1 (для групп): День | Пара1-7 (по строкам)
+    Формат 2 (для преподавателей): День | Пара1 | Пара2 | ... | Пара7 (по колонкам)
+    """
     lessons = []
-    # Ищем таблицу, в которой есть заголовок «День недели» (в первой строке или в любом месте)
+    
+    # Ищем таблицу, в которой есть заголовок «День недели»
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
         if len(rows) < 5:
@@ -186,48 +209,193 @@ def _parse_schedule_table(soup: BeautifulSoup, source: Source):
         table_text = table.get_text()
         if "День недели" not in table_text:
             continue
+        
         first_row_cells = rows[0].find_all(["th", "td"])
         first_row_text = " ".join(c.get_text(strip=True) for c in first_row_cells)
         if "День недели" not in first_row_text:
             continue
 
-        current_day = ""
-        for tr in rows[1:]:
-            cells = tr.find_all(["th", "td"])
-            if len(cells) < 2:
-                continue
-            if len(cells) == 3:
-                current_day = cells[0].get_text(strip=True)
-                pair_num = cells[1].get_text(strip=True)
-                content_cell = cells[2]
-            else:
-                pair_num = cells[0].get_text(strip=True)
-                content_cell = cells[1]
+        # Проверим формат: если в первой строке 8+ ячеек (День + 7 пар), это формат 2
+        if len(first_row_cells) >= 8:
+            # Формат 2: горизонтальный (День | Пара1 | Пара2 | ... | Пара7)
+            lessons = _parse_horizontal_schedule(table, source)
+        else:
+            # Формат 1: вертикальный (День | Пара | День | Пара | ...)
+            lessons = _parse_vertical_schedule(table, source)
+        
+        if lessons:
+            break
+    
+    return lessons
 
-            pair_num = pair_num.replace("\n", "").strip()
-            if not pair_num.isdigit():
-                continue
-            if len(cells) == 2 and not current_day:
-                continue
 
-            raw = content_cell.get_text(separator="\n")
+def _parse_vertical_schedule(table, source: Source):
+    """Парсит вертикальный формат: День | Пара | Содержание"""
+    lessons = []
+    rows = table.find_all("tr")
+    current_day = ""
+    
+    for tr in rows[1:]:
+        cells = tr.find_all(["th", "td"])
+        if len(cells) < 2:
+            continue
+        
+        if len(cells) == 3:
+            # День явно указан в первой колонке
+            current_day = cells[0].get_text(strip=True)
+            pair_num = cells[1].get_text(strip=True)
+            content_cell = cells[2]
+        else:
+            # День из предыдущей строки, пара в первой колонке
+            pair_num = cells[0].get_text(strip=True)
+            content_cell = cells[1]
+
+        pair_num = pair_num.replace("\n", "").strip()
+        if not pair_num.isdigit():
+            continue
+        if len(cells) == 2 and not current_day:
+            continue
+
+        raw = content_cell.get_text(separator="\n")
+        lines = [s.strip() for s in raw.split("\n") if s.strip() and s.strip() != "&nbsp;"]
+
+        for line in lines:
+            if len(line) < 5:
+                continue
+            # Формат: ...Дисциплина(Л|П|лаб|сем) Преподаватель место
+            m = re.search(r"\((Л|П|лаб|сем)\)\s+(.+)$", line)
+            if not m:
+                continue
+            lesson_type = m.group(1)
+            rest = line[: m.start()].strip()
+            discipline = re.sub(r"^\d+(?:\s*-\s*\d+)?(?:\s*\(\d+\))?\s+", "", rest).strip()
+            if not discipline:
+                discipline = rest
+            lessons.append(
+                Lesson(
+                    date=current_day,
+                    pair=pair_num,
+                    discipline=discipline,
+                    type=lesson_type,
+                    owner=source.query,
+                    priority=source.priority,
+                )
+            )
+    
+    return lessons
+
+
+def _parse_horizontal_schedule(table, source: Source):
+    """Парсит горизонтальный формат: День | Пара1 | Пара2 | ... | Пара7
+    
+    Поддерживает два варианта:
+    1. Для групп: День | Пара1 | Пара2 | ... | Пара7 (по колонкам)
+    2. Для преподавателей: День | 1 пара | 2 пара | ... (по колонкам с группами/кодами)
+    """
+    lessons = []
+    rows = table.find_all("tr")
+    if not rows:
+        return lessons
+    
+    # Ищем строку с заголовками пар — может быть в позициях 0, 1 или 2
+    # (иногда есть временная строка перед днями)
+    header_row_idx = 0
+    pair_numbers = []
+    
+    # Пытаемся найти заголовок с "День недели"
+    for idx, row in enumerate(rows[:3]):
+        row_text = row.get_text(strip=True)
+        if "День недели" in row_text or "недели" in row_text:
+            header_row_idx = idx
+            break
+    
+    header_cells = rows[header_row_idx].find_all(["th", "td"])
+    
+    # Извлекаем номера пар из заголовков
+    for i, cell in enumerate(header_cells):
+        text = cell.get_text(strip=True)
+        if i == 0:
+            # Первая колонка — "День недели"
+            continue
+        # Пропускаем колонки с "ПЕРЕРЫВ" и другие не-пары
+        if "ПЕРЕРЫВ" in text or "перерыв" in text:
+            pair_numbers.append("")
+            continue
+        # Извлекаем номер пары (может быть "1", "1 пара", "Пара 1", "4 пара (веч.)" и т.д.)
+        num_match = re.search(r"\d+", text)
+        if num_match:
+            pair_numbers.append(num_match.group())
+        else:
+            pair_numbers.append("")
+    
+    # Пропускаем заголовок и служебные строки (типа временной строки)
+    # Начинаем со строки после заголовка
+    for tr in rows[header_row_idx + 1:]:
+        cells = tr.find_all(["th", "td"])
+        if len(cells) < 2:
+            continue
+        
+        # Первая ячейка должна содержать день недели или время
+        day_cell = cells[0]
+        day_text = day_cell.get_text(strip=True)
+        
+        # Проверяем, это ли день недели (исключаем временные строки вида "08:45-10:20")
+        if re.match(r"^\d{2}:\d{2}", day_text):
+            # Это временная строка, пропускаем
+            continue
+        
+        weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс', 
+                    'Пн.', 'Вт.', 'Ср.', 'Чт.', 'Пт.', 'Сб.', 'Вс.',
+                    'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
+        if not any(w in day_text for w in weekdays):
+            continue
+        
+        # Обрабатываем каждую пару в этом дне
+        for pair_idx, pair_cell in enumerate(cells[1:]):
+            if pair_idx >= len(pair_numbers):
+                break
+            
+            pair_num = pair_numbers[pair_idx]
+            if not pair_num:
+                continue
+            
+            raw = pair_cell.get_text(separator="\n")
             lines = [s.strip() for s in raw.split("\n") if s.strip() and s.strip() != "&nbsp;"]
-
+            
             for line in lines:
-                if len(line) < 5:
+                if len(line) < 3:
                     continue
-                # Формат: ...Дисциплина(Л|П|лаб|сем) Преподаватель место — пробела перед скобкой может не быть
+                
+                # Формат для групп: Дисциплина(Л|П|лаб|сем) Преподаватель место
                 m = re.search(r"\((Л|П|лаб|сем)\)\s+(.+)$", line)
-                if not m:
-                    continue
-                lesson_type = m.group(1)
-                rest = line[: m.start()].strip()
-                discipline = re.sub(r"^\d+(?:\s*-\s*\d+)?(?:\s*\(\d+\))?\s+", "", rest).strip()
-                if not discipline:
-                    discipline = rest
+                if m:
+                    lesson_type = m.group(1)
+                    rest = line[: m.start()].strip()
+                    discipline = re.sub(r"^\d+(?:\s*-\s*\d+)?(?:\s*\(\d+\))?\s+", "", rest).strip()
+                    if not discipline:
+                        discipline = rest
+                else:
+                    # Формат для преподавателей: Группы; Код; Аудитория(Тип)
+                    # Пример: н31-31;34-34; БТБ-25-03*1;  а- 228(П);
+                    m = re.search(r"(\d+[а-яА-Я]*)\s*\(([ЛПлсаб]+)\)\s*;", line)
+                    if m:
+                        # Это может быть комната с типом
+                        lesson_type = m.group(2)
+                        # Пытаемся найти дисциплину в коде (паттерн вроде БТБ-25-03)
+                        code_match = re.search(r"[А-Яа-я]{2,4}-\d{2}-\d{2}", line)
+                        if code_match:
+                            discipline = code_match.group().strip()
+                        else:
+                            # Если нет кода, используем всю строку до комнаты
+                            before_room = re.sub(r"\d+\([А-Яа-я]*\).*$", "", line).strip()
+                            discipline = before_room if before_room else "Неизвестная дисциплина"
+                    else:
+                        # Не в ожидаемом формате
+                        continue
+                
                 lessons.append(
                     Lesson(
-                        date=current_day,
+                        date=day_text,
                         pair=pair_num,
                         discipline=discipline,
                         type=lesson_type,
@@ -235,39 +403,67 @@ def _parse_schedule_table(soup: BeautifulSoup, source: Source):
                         priority=source.priority,
                     )
                 )
-        if lessons:
-            break
+    
     return lessons
 
 
-def fetch_schedule(source: Source, save_debug_html: bool = False):
+
+def fetch_schedule(source: Source, save_debug_html: bool = True):
     logs = []
-    url = build_url(source)
-    logs.append(f"Запрос: {url}")
-
-    html = None
-    status = 0
-    try:
-        html, status = _fetch_page(url, source, use_post=False)
-        logs.append(f"Статус (GET): {status}")
-    except Exception as e:
-        logs.append(f"Ошибка GET: {e}")
-        html = None
-
-    if html:
-        soup = BeautifulSoup(html, "html.parser")
-        lessons = _parse_schedule_table(soup, source)
-        if not lessons:
-            logs.append("По GET расписание не найдено, пробуем POST…")
-            try:
-                html, status = _fetch_page(f"{BASE_URL}index.php", source, use_post=True)
-                logs.append(f"Статус (POST): {status}")
+    
+    # Для преподавателей на kid/vak используем GET (проще и надёжнее)
+    if source.search_type == "teacher" and (source.kid or source.vak):
+        logs.append(f"Преподаватель {source.query}: kid={source.kid}, vak={source.vak}")
+        try:
+            # Используем GET с правильно составленным URL
+            url = build_url(source)
+            logs.append(f"Запрос: {url[:100]}...")
+            html, status = _fetch_page(url, source, use_post=False)
+            logs.append(f"Статус (GET): {status}")
+            
+            # Проверяем, есть ли расписание в HTML (таблица с "День недели")
+            if "День недели" in html:
                 soup = BeautifulSoup(html, "html.parser")
                 lessons = _parse_schedule_table(soup, source)
-            except Exception as e:
-                logs.append(f"Ошибка POST: {e}")
+                if lessons:
+                    logs.append(f"Расписание загружено успешно")
+                else:
+                    logs.append("Таблица найдена но занятия не распарсены")
+            else:
+                logs.append("Ответ не содержит расписание (нет 'День недели')")
+                lessons = []
+        except Exception as e:
+            logs.append(f"Ошибка: {e}")
+            lessons = []
+            html = None
     else:
-        lessons = []
+        # Для групп и преподавателей без kid/vak
+        url = build_url(source)
+        logs.append(f"Запрос: {url}")
+
+        html = None
+        status = 0
+        try:
+            html, status = _fetch_page(url, source, use_post=False)
+            logs.append(f"Статус (GET): {status}")
+        except Exception as e:
+            logs.append(f"Ошибка GET: {e}")
+            html = None
+
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+            lessons = _parse_schedule_table(soup, source)
+            if not lessons:
+                logs.append("По GET расписание не найдено, пробуем POST…")
+                try:
+                    html, status = _fetch_page(f"{BASE_URL}index.php", source, use_post=True)
+                    logs.append(f"Статус (POST): {status}")
+                    soup = BeautifulSoup(html, "html.parser")
+                    lessons = _parse_schedule_table(soup, source)
+                except Exception as e:
+                    logs.append(f"Ошибка POST: {e}")
+        else:
+            lessons = []
 
     if save_debug_html and html:
         safe_name = re.sub(r'[<>:"/\\|?*]', "_", source.query)[:50]
@@ -541,7 +737,9 @@ class AddTeacherSourceDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось получить страницу с кафедрами:\n{e}")
             return
-
+        # 🔥 DEBUG: сохраняем HTML
+        with open("debug_teachers.html", "w", encoding="utf-8") as f:
+            f.write(page_html)
         raw = html.unescape(page_html)
         soup = BeautifulSoup(raw, "html.parser")
         # элемент, в который вставляется <select id="rfio" или блок slov_kafedr
@@ -622,6 +820,10 @@ class AddTeacherSourceDialog(QDialog):
             QMessageBox.critical(self, "Ошибка", f"Не удалось получить страницу преподавателей:\n{e}")
             return
 
+        # 🔥 DEBUG: сохраняем HTML
+        with open("debug_teachers.html", "w", encoding="utf-8") as f:
+            f.write(page_html)
+
         raw = html.unescape(page_html)
         soup = BeautifulSoup(raw, "html.parser")
         select = soup.find("select", id="kadrvak")
@@ -648,29 +850,73 @@ class AddTeacherSourceDialog(QDialog):
             QMessageBox.critical(self, "Ошибка", "Не удалось найти список преподавателей на странице.")
             return
 
+        # Обрабатываем каждую option — извлекаем КАЖДОГО преподавателя отдельно
+        teachers_added = 0
         for opt in options:
             value = opt.get("value") or ""
-            # ensure spaces between fragments so names don't run together
-            fio = opt.get_text(separator=" ", strip=True)
-            # same encoding fix
+            fio = opt.get_text(strip=True)  # берем текст именно этого option (одного преподавателя)
+            
+            # Если в одном option записано много вакансий через пробел/(число), 
+            # попытаемся распарсить каждого отдельно
+            # Пример: "Асеев С.О. Астафьева А.Д. Амметзянова З.Р."
+            # Ищем шаблон: "ФИ.И." (Фамилия Инициал.Инициал.)
+            if value != "0" and fio and len(fio) > 3:
+                # Старнаемся распарсить по паттерну ФИО
+                # Паттерн: Слово (с заглавной) дальше может быть пробел или буква
+                # Ищем ФИО паттерны вроде "Формат: Слово Буква.Буква." или "Слово Слово Буква.Буква."
+                names = re.finditer(r'[А-Я][а-я]+ [А-Я]\.[А-Я]\.', fio)
+                found_names = [m.group() for m in names]
+                
+                if found_names and len(found_names) > 1:
+                    # Если нашли несколько ФИО в одной опции, распарсим каждое отдельно
+                    for single_name in found_names:
+                        single_fio = single_name.strip()
+                        if not single_fio:
+                            continue
+                        try:
+                            single_fio = single_fio.encode("latin1").decode("cp1251")
+                        except Exception:
+                            pass
+                        if value != "0" and single_fio and len(single_fio) >= 2:
+                            parts = value.split("@")
+                            if len(parts) >= 2:
+                                try:
+                                    vak_flag = int(parts[0])
+                                    tid = int(parts[1])
+                                    self.teacher_box.addItem(single_fio, (vak_flag, tid))
+                                    teachers_added += 1
+                                except ValueError:
+                                    pass
+                    continue
+            
+            # Стандартная обработка одиночного ФИО
+            # Декодируем кодировку если нужно
             try:
                 fio = fio.encode("latin1").decode("cp1251")
             except Exception:
                 pass
-            if value == "0" or not fio:
+            
+            # Пропускаем пустые и служебные опции
+            if value == "0" or not fio or len(fio) < 2:
                 continue
+            
+            # Парсим value в формате "flag@id"
             parts = value.split("@")
             if len(parts) < 2:
                 continue
+            
             try:
                 vak_flag = int(parts[0])
                 tid = int(parts[1])
             except ValueError:
                 continue
+            
+            # Добавляем только этого преподавателя
             self.teacher_box.addItem(fio, (vak_flag, tid))
+            teachers_added += 1
 
         if self.teacher_box.count() == 0:
-            QMessageBox.warning(self, "Пусто", "Преподаватели не найдены на странице.")
+            QMessageBox.critical(self, "Пусто", f"Преподаватели не найдены (обработано {teachers_added} опций). Смотрите debug_teachers.html.")
             return
         self.teacher_box.setEnabled(True)
 
