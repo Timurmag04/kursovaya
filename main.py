@@ -193,14 +193,45 @@ def _fetch_page(url: str, source: Source, use_post: bool) -> Tuple[str, int]:
     html = _decode_schedule_html(r.content)
     return html, r.status_code
 
+
+
+def _strip_week_range(text: str, current_week: int | None):
+    """Уберём префикс с номером(ами) недели и проверим, нужно ли этот урок брать.
+
+    Тексты на странице часто начинаются с диапазона недель, например:
+    "31 - 31 Безопасность..." или "12".
+    Если текущая неделя известна, возвращаем ``(True, cleaned_text)`` только
+    когда она попадает в указанный промежуток. Иначе (нет префикса) — просто
+    возвращаем исходный текст.
+    """
+    m = re.match(r"^(\d+)(?:\s*[-–]\s*(\d+))?\s+(.*)", text)
+    if m:
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else start
+        if current_week is not None and not (start <= current_week <= end):
+            return False, None
+        return True, m.group(3)
+    return True, text
+
+
 def _parse_schedule_table(soup: BeautifulSoup, source: Source):
     """Парсит таблицу расписания: поддерживает оба формата.
-    
+
     Формат 1 (для групп): День | Пара1-7 (по строкам)
     Формат 2 (для преподавателей): День | Пара1 | Пара2 | ... | Пара7 (по колонкам)
     """
     lessons = []
-    
+
+    # Попытаемся извлечь номер текущей учебной недели из текста страницы.
+    current_week = None
+    page_text = soup.get_text(" ", strip=True)
+    mweek = re.search(r"идет\s+(\d+)\s+учебн", page_text, re.I)
+    if mweek:
+        try:
+            current_week = int(mweek.group(1))
+        except ValueError:
+            current_week = None
+
     # Ищем таблицу, в которой есть заголовок «День недели»
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
@@ -209,7 +240,7 @@ def _parse_schedule_table(soup: BeautifulSoup, source: Source):
         table_text = table.get_text()
         if "День недели" not in table_text:
             continue
-        
+
         first_row_cells = rows[0].find_all(["th", "td"])
         first_row_text = " ".join(c.get_text(strip=True) for c in first_row_cells)
         if "День недели" not in first_row_text:
@@ -217,29 +248,27 @@ def _parse_schedule_table(soup: BeautifulSoup, source: Source):
 
         # Проверим формат: если в первой строке 8+ ячеек (День + 7 пар), это формат 2
         if len(first_row_cells) >= 8:
-            # Формат 2: горизонтальный (День | Пара1 | Пара2 | ... | Пара7)
-            lessons = _parse_horizontal_schedule(table, source)
+            lessons = _parse_horizontal_schedule(table, source, current_week)
         else:
-            # Формат 1: вертикальный (День | Пара | День | Пара | ...)
-            lessons = _parse_vertical_schedule(table, source)
-        
+            lessons = _parse_vertical_schedule(table, source, current_week)
+
         if lessons:
             break
-    
+
     return lessons
 
 
-def _parse_vertical_schedule(table, source: Source):
+def _parse_vertical_schedule(table, source: Source, current_week: int | None):
     """Парсит вертикальный формат: День | Пара | Содержание"""
     lessons = []
     rows = table.find_all("tr")
     current_day = ""
-    
+
     for tr in rows[1:]:
         cells = tr.find_all(["th", "td"])
         if len(cells) < 2:
             continue
-        
+
         if len(cells) == 3:
             # День явно указан в первой колонке
             current_day = cells[0].get_text(strip=True)
@@ -262,6 +291,12 @@ def _parse_vertical_schedule(table, source: Source):
         for line in lines:
             if len(line) < 5:
                 continue
+
+            ok, clean = _strip_week_range(line, current_week)
+            if not ok:
+                continue
+            line = clean
+
             # Формат: ...Дисциплина(Л|П|лаб|сем) Преподаватель место
             m = re.search(r"\((Л|П|лаб|сем)\)\s+(.+)$", line)
             if not m:
@@ -281,13 +316,13 @@ def _parse_vertical_schedule(table, source: Source):
                     priority=source.priority,
                 )
             )
-    
+
     return lessons
 
 
-def _parse_horizontal_schedule(table, source: Source):
+def _parse_horizontal_schedule(table, source: Source, current_week: int | None):
     """Парсит горизонтальный формат: День | Пара1 | Пара2 | ... | Пара7
-    
+
     Поддерживает два варианта:
     1. Для групп: День | Пара1 | Пара2 | ... | Пара7 (по колонкам)
     2. Для преподавателей: День | 1 пара | 2 пара | ... (по колонкам с группами/кодами)
@@ -296,21 +331,21 @@ def _parse_horizontal_schedule(table, source: Source):
     rows = table.find_all("tr")
     if not rows:
         return lessons
-    
+
     # Ищем строку с заголовками пар — может быть в позициях 0, 1 или 2
     # (иногда есть временная строка перед днями)
     header_row_idx = 0
     pair_numbers = []
-    
+
     # Пытаемся найти заголовок с "День недели"
     for idx, row in enumerate(rows[:3]):
         row_text = row.get_text(strip=True)
         if "День недели" in row_text or "недели" in row_text:
             header_row_idx = idx
             break
-    
+
     header_cells = rows[header_row_idx].find_all(["th", "td"])
-    
+
     # Извлекаем номера пар из заголовков
     for i, cell in enumerate(header_cells):
         text = cell.get_text(strip=True)
@@ -327,45 +362,50 @@ def _parse_horizontal_schedule(table, source: Source):
             pair_numbers.append(num_match.group())
         else:
             pair_numbers.append("")
-    
+
     # Пропускаем заголовок и служебные строки (типа временной строки)
     # Начинаем со строки после заголовка
     for tr in rows[header_row_idx + 1:]:
         cells = tr.find_all(["th", "td"])
         if len(cells) < 2:
             continue
-        
+
         # Первая ячейка должна содержать день недели или время
         day_cell = cells[0]
         day_text = day_cell.get_text(strip=True)
-        
+
         # Проверяем, это ли день недели (исключаем временные строки вида "08:45-10:20")
         if re.match(r"^\d{2}:\d{2}", day_text):
             # Это временная строка, пропускаем
             continue
-        
+
         weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс', 
                     'Пн.', 'Вт.', 'Ср.', 'Чт.', 'Пт.', 'Сб.', 'Вс.',
                     'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
         if not any(w in day_text for w in weekdays):
             continue
-        
+
         # Обрабатываем каждую пару в этом дне
         for pair_idx, pair_cell in enumerate(cells[1:]):
             if pair_idx >= len(pair_numbers):
                 break
-            
+
             pair_num = pair_numbers[pair_idx]
             if not pair_num:
                 continue
-            
+
             raw = pair_cell.get_text(separator="\n")
             lines = [s.strip() for s in raw.split("\n") if s.strip() and s.strip() != "&nbsp;"]
-            
+
             for line in lines:
                 if len(line) < 3:
                     continue
-                
+
+                ok, clean = _strip_week_range(line, current_week)
+                if not ok:
+                    continue
+                line = clean
+
                 # Формат для групп: Дисциплина(Л|П|лаб|сем) Преподаватель место
                 m = re.search(r"\((Л|П|лаб|сем)\)\s+(.+)$", line)
                 if m:
