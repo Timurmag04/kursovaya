@@ -493,7 +493,15 @@ def merge_sources(sources):
         logs.extend(source_logs)
 
         for lesson in lessons:
-            key = (lesson.date, lesson.pair)
+            # Для преподавателей не нужно сводить по дате/паре —
+            # иначе при одновременных занятиях разных преподавателей
+            # останется только первый источник (видимое поведение).
+            # Поэтому ключ для учителей включает владельца.
+            if source.search_type == "teacher":
+                key = (lesson.date, lesson.pair, lesson.owner)
+            else:
+                key = (lesson.date, lesson.pair)
+
             if key not in result:
                 result[key] = lesson
             else:
@@ -524,8 +532,11 @@ class ConflictDialog(QDialog):
             layout.addWidget(QLabel("Конфликтов не найдено"))
         else:
             for key, lessons_list in conflicts.items():
-                date, pair = key
-                layout.addWidget(QLabel(f"<b>{date} | Пара {pair}</b>"))
+                # поддерживаем разные форматы ключа
+                date = key[0]
+                pair = key[1] if len(key) > 1 else "?"
+                owner_info = f" — {key[2]}" if len(key) > 2 else ""
+                layout.addWidget(QLabel(f"<b>{date} | Пара {pair}{owner_info}</b>"))
                 for lesson in lessons_list:
                     layout.addWidget(QLabel(f"  • {lesson.discipline} ({lesson.type}) — {lesson.owner}"))
                 layout.addSpacing(10)
@@ -850,43 +861,44 @@ class AddTeacherSourceDialog(QDialog):
             QMessageBox.critical(self, "Ошибка", "Не удалось найти список преподавателей на странице.")
             return
 
-        # Обрабатываем каждую option — извлекаем КАЖДОГО преподавателя отдельно
+        # Обрабатываем каждую option — извлекаем по одному преподавателю.
         teachers_added = 0
         for opt in options:
             value = opt.get("value") or ""
-            fio = opt.get_text(strip=True)  # берем текст именно этого option (одного преподавателя)
-            
-            # Если в одном option записано много вакансий через пробел/(число), 
-            # попытаемся распарсить каждого отдельно
-            # Пример: "Асеев С.О. Астафьева А.Д. Амметзянова З.Р."
-            # Ищем шаблон: "ФИ.И." (Фамилия Инициал.Инициал.)
+            # берем только прямой текст внутри тега (если есть вложения, они
+            # попадают в opt.contents и не учитываются) — это спасает при сломанной
+            # разметке, когда один <option> содержит всех потомков.
+            fio_parts = [t for t in opt.contents if isinstance(t, str)]
+            fio = "".join(fio_parts).strip()
+            fio = fio.replace("\xa0", " ").strip()
+
+            # Если в одном option записано несколько фамилий, обрабатываем тоже.
+            # Пример: "Асеев С.О. Астафьева А.Д.".
             if value != "0" and fio and len(fio) > 3:
-                # Старнаемся распарсить по паттерну ФИО
-                # Паттерн: Слово (с заглавной) дальше может быть пробел или буква
-                # Ищем ФИО паттерны вроде "Формат: Слово Буква.Буква." или "Слово Слово Буква.Буква."
-                names = re.finditer(r'[А-Я][а-я]+ [А-Я]\.[А-Я]\.', fio)
-                found_names = [m.group() for m in names]
-                
-                if found_names and len(found_names) > 1:
-                    # Если нашли несколько ФИО в одной опции, распарсим каждое отдельно
-                    for single_name in found_names:
-                        single_fio = single_name.strip()
+                names = list(re.finditer(r'[А-Я][а-я]+ [А-Я]\.[А-Я]\.', fio))
+                if len(names) > 1:
+                    id_tokens = re.findall(r"\d+@\d+@", value)
+                    if not id_tokens:
+                        id_tokens = [value]
+                    for idx, m in enumerate(names):
+                        single_fio = m.group().strip()
                         if not single_fio:
                             continue
+                        # декодируем на всякий случай cp1251
                         try:
                             single_fio = single_fio.encode("latin1").decode("cp1251")
                         except Exception:
                             pass
-                        if value != "0" and single_fio and len(single_fio) >= 2:
-                            parts = value.split("@")
-                            if len(parts) >= 2:
-                                try:
-                                    vak_flag = int(parts[0])
-                                    tid = int(parts[1])
-                                    self.teacher_box.addItem(single_fio, (vak_flag, tid))
-                                    teachers_added += 1
-                                except ValueError:
-                                    pass
+                        tok = id_tokens[idx] if idx < len(id_tokens) else id_tokens[0]
+                        parts = tok.split("@")
+                        if len(parts) >= 2:
+                            try:
+                                vak_flag = int(parts[0])
+                                tid = int(parts[1])
+                                self.teacher_box.addItem(single_fio, (vak_flag, tid))
+                                teachers_added += 1
+                            except ValueError:
+                                pass
                     continue
             
             # Стандартная обработка одиночного ФИО
@@ -1058,8 +1070,11 @@ class MainWindow(QMainWindow):
                 if w:
                     w.deleteLater()
             for key, lessons_list in conflicts.items():
-                date, pair = key
-                old_layout.addWidget(QLabel(f"<b>{date} | Пара {pair}</b>"))
+                # ключ может быть (date, pair) или (date, pair, owner)
+                date = key[0]
+                pair = key[1] if len(key) > 1 else "?"
+                owner_info = f" — {key[2]}" if len(key) > 2 else ""
+                old_layout.addWidget(QLabel(f"<b>{date} | Пара {pair}{owner_info}</b>"))
                 for lesson in lessons_list:
                     old_layout.addWidget(QLabel(f"  • {lesson.discipline} ({lesson.type}) — {lesson.owner}"))
                 old_layout.addSpacing(12)
