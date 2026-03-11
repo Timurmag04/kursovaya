@@ -2,7 +2,7 @@ import sys
 import json
 import re
 import html
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Tuple, Optional
 import urllib.parse
 import requests
@@ -13,16 +13,14 @@ from PySide6.QtWidgets import (
     QPushButton, QListWidget, QListWidgetItem,
     QLabel, QTabWidget, QHBoxLayout, QLineEdit,
     QComboBox, QSpinBox, QMessageBox,
-    QDialog, QTextEdit, QFormLayout, QStackedWidget,
+    QDialog, QFormLayout, QStackedWidget,
     QScrollArea, QFrame,
 )
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QTextCursor
 
 SOURCES_FILE = "sources.json"
 BASE_URL = "https://raspisanie.rusoil.net/rasp_old/"
 
-# Общая сессия для поддержания cookies/referer, как в браузере
 SESSION = Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -52,6 +50,7 @@ WEEKDAY_ORDER = {
     "Воскресенье": 7,
 }
 
+
 @dataclass
 class Lesson:
     date: str
@@ -60,6 +59,9 @@ class Lesson:
     type: str
     owner: str
     priority: int
+    groups: List[str] = field(default_factory=list)
+    auditorium: str = "онлайн"
+
 
 @dataclass
 class Source:
@@ -74,6 +76,7 @@ class Source:
     kid: Optional[int] = None
     vak: Optional[int] = None
 
+
 def load_sources():
     try:
         with open(SOURCES_FILE, "r", encoding="utf-8") as f:
@@ -82,50 +85,39 @@ def load_sources():
     except:
         return []
 
+
 def save_sources(sources):
     with open(SOURCES_FILE, "w", encoding="utf-8") as f:
         json.dump([asdict(s) for s in sources], f, indent=4, ensure_ascii=False)
 
+
 def build_url(source: Source):
-    """
-    Строит URL для получения расписания.
-    - Для групп: index.php?gruppa=...
-    - Для преподавателей:
-        * если известны kid/vak и кафедра — как в showbegunokprep (Ajaxm.js)
-        * иначе старый поиск по фамилии.
-    """
     if source.search_type == "group":
         q = urllib.parse.quote_plus(source.query)
         return f"{BASE_URL}index.php?gruppa={q}&sem=0"
 
-    # Преподаватель
-    # Если в источнике сохранены реальные идентификаторы с сайта
     if source.kaf and (source.kid or source.vak):
         filial = source.filial or 1
         kaf = source.kaf
         family = urllib.parse.quote(source.query or "", encoding="utf-8")
         kafedra = urllib.parse.quote(source.kaf_name or "", encoding="utf-8")
         if source.kid:
-            # Не вакансия
             return (
                 f"{BASE_URL}index.php?"
                 f"kid={source.kid}&vak=0&family={family}"
                 f"&kaf={kaf}&kafedra={kafedra}&sem=0&filial={filial}"
             )
-        # Вакансия
         return (
             f"{BASE_URL}index.php?"
             f"kid=0&vak={source.vak}&family={family}"
             f"&kaf={kaf}&kafedra={kafedra}&sem=0&filial={filial}"
         )
 
-    # Fallback: поиск по фамилии, как раньше
     q = urllib.parse.quote_plus(source.query)
     return f"{BASE_URL}index.php?family={q}&sem=0"
 
 
 def _decode_schedule_html(raw: bytes) -> str:
-    """Декодирует HTML расписания (сайт может отдавать UTF-8 или cp1251)."""
     for enc in ("utf-8", "cp1251"):
         try:
             text = raw.decode(enc)
@@ -137,27 +129,17 @@ def _decode_schedule_html(raw: bytes) -> str:
 
 
 def _decode_ajax_html(raw: bytes) -> str:
-    """Декодирует ответы Ajaxm.php (списки кафедр и преподавателей).
-
-    Сайт иногда отвечает в utf-8, иногда в cp1251. Раньше мы ориентировались по
-    фрагментам start008/start006, но в некоторых ответах их может не быть и мы
-    получали кривой текст (особенно в случае докторских списков). Поэтому теперь
-    смотрим просто на наличие кириллицы, а не только на служебные токены.
-    """
     for enc in ("utf-8", "cp1251"):
         try:
             text = raw.decode(enc)
-            # при удачном декоде либо есть кириллица, либо служебный маркер
             if re.search(r"[А-Яа-я]", text) or "start008" in text or "start006" in text:
                 return text
         except (UnicodeDecodeError, LookupError):
             continue
-    # ничего не подошло, просто прогоняем через utf-8 с заменой, чтобы не падать
     return raw.decode("utf-8", errors="replace")
 
 
 def _fetch_page(url: str, source: Source, use_post: bool) -> Tuple[str, int]:
-    """Возвращает (html_text, status_code)."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
@@ -168,7 +150,6 @@ def _fetch_page(url: str, source: Source, use_post: bool) -> Tuple[str, int]:
         if source.search_type == "group":
             data["gruppa"] = source.query
         else:
-            # Для преподавателя: если есть kid/vak, используем их вместе с другими параметрами
             if source.kid or source.vak:
                 if source.kid:
                     data["kid"] = str(source.kid)
@@ -176,7 +157,6 @@ def _fetch_page(url: str, source: Source, use_post: bool) -> Tuple[str, int]:
                 else:
                     data["kid"] = "0"
                     data["vak"] = str(source.vak)
-                # Добавляем другие необходимые параметры для полного запроса
                 data["family"] = source.query
                 if source.kaf:
                     data["kaf"] = str(source.kaf)
@@ -185,25 +165,15 @@ def _fetch_page(url: str, source: Source, use_post: bool) -> Tuple[str, int]:
                 if source.filial:
                     data["filial"] = str(source.filial)
             else:
-                # Fallback: по фамилии
                 data["family"] = source.query
         r = requests.post(url, data=data, timeout=15, headers=headers)
     else:
         r = requests.get(url, timeout=15, headers=headers)
-    html = _decode_schedule_html(r.content)
-    return html, r.status_code
-
+    html_text = _decode_schedule_html(r.content)
+    return html_text, r.status_code
 
 
 def _strip_week_range(text: str, current_week: int | None):
-    """Уберём префикс с номером(ами) недели и проверим, нужно ли этот урок брать.
-
-    Тексты на странице часто начинаются с диапазона недель, например:
-    "31 - 31 Безопасность..." или "12".
-    Если текущая неделя известна, возвращаем ``(True, cleaned_text)`` только
-    когда она попадает в указанный промежуток. Иначе (нет префикса) — просто
-    возвращаем исходный текст.
-    """
     m = re.match(r"^(\d+)(?:\s*[-–]\s*(\d+))?\s+(.*)", text)
     if m:
         start = int(m.group(1))
@@ -215,14 +185,8 @@ def _strip_week_range(text: str, current_week: int | None):
 
 
 def _parse_schedule_table(soup: BeautifulSoup, source: Source):
-    """Парсит таблицу расписания: поддерживает оба формата.
-
-    Формат 1 (для групп): День | Пара1-7 (по строкам)
-    Формат 2 (для преподавателей): День | Пара1 | Пара2 | ... | Пара7 (по колонкам)
-    """
     lessons = []
 
-    # Попытаемся извлечь номер текущей учебной недели из текста страницы.
     current_week = None
     page_text = soup.get_text(" ", strip=True)
     mweek = re.search(r"идет\s+(\d+)\s+учебн", page_text, re.I)
@@ -232,7 +196,6 @@ def _parse_schedule_table(soup: BeautifulSoup, source: Source):
         except ValueError:
             current_week = None
 
-    # Ищем таблицу, в которой есть заголовок «День недели»
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
         if len(rows) < 5:
@@ -246,7 +209,6 @@ def _parse_schedule_table(soup: BeautifulSoup, source: Source):
         if "День недели" not in first_row_text:
             continue
 
-        # Проверим формат: если в первой строке 8+ ячеек (День + 7 пар), это формат 2
         if len(first_row_cells) >= 8:
             lessons = _parse_horizontal_schedule(table, source, current_week)
         else:
@@ -259,7 +221,6 @@ def _parse_schedule_table(soup: BeautifulSoup, source: Source):
 
 
 def _parse_vertical_schedule(table, source: Source, current_week: int | None):
-    """Парсит вертикальный формат: День | Пара | Содержание"""
     lessons = []
     rows = table.find_all("tr")
     current_day = ""
@@ -270,12 +231,10 @@ def _parse_vertical_schedule(table, source: Source, current_week: int | None):
             continue
 
         if len(cells) == 3:
-            # День явно указан в первой колонке
             current_day = cells[0].get_text(strip=True)
             pair_num = cells[1].get_text(strip=True)
             content_cell = cells[2]
         else:
-            # День из предыдущей строки, пара в первой колонке
             pair_num = cells[0].get_text(strip=True)
             content_cell = cells[1]
 
@@ -292,255 +251,302 @@ def _parse_vertical_schedule(table, source: Source, current_week: int | None):
             if len(line) < 5:
                 continue
 
-            ok, clean = _strip_week_range(line, current_week)
-            if not ok:
-                continue
-            line = clean
-
-            # Формат: ...Дисциплина(Л|П|лаб|сем) Преподаватель место
-            m = re.search(r"\((Л|П|лаб|сем)\)\s+(.+)$", line)
-            if not m:
-                continue
-            lesson_type = m.group(1)
-            rest = line[: m.start()].strip()
-            discipline = re.sub(r"^\d+(?:\s*-\s*\d+)?(?:\s*\(\d+\))?\s+", "", rest).strip()
-            if not discipline:
-                discipline = rest
-            lessons.append(
-                Lesson(
-                    date=current_day,
-                    pair=pair_num,
-                    discipline=discipline,
-                    type=lesson_type,
-                    owner=source.query,
-                    priority=source.priority,
-                )
-            )
-
-    return lessons
-
-
-def _parse_horizontal_schedule(table, source: Source, current_week: int | None):
-    """Парсит горизонтальный формат: День | Пара1 | Пара2 | ... | Пара7
-
-    Поддерживает два варианта:
-    1. Для групп: День | Пара1 | Пара2 | ... | Пара7 (по колонкам)
-    2. Для преподавателей: День | 1 пара | 2 пара | ... (по колонкам с группами/кодами)
-    """
-    lessons = []
-    rows = table.find_all("tr")
-    if not rows:
-        return lessons
-
-    # Ищем строку с заголовками пар — может быть в позициях 0, 1 или 2
-    # (иногда есть временная строка перед днями)
-    header_row_idx = 0
-    pair_numbers = []
-
-    # Пытаемся найти заголовок с "День недели"
-    for idx, row in enumerate(rows[:3]):
-        row_text = row.get_text(strip=True)
-        if "День недели" in row_text or "недели" in row_text:
-            header_row_idx = idx
-            break
-
-    header_cells = rows[header_row_idx].find_all(["th", "td"])
-
-    # Извлекаем номера пар из заголовков
-    for i, cell in enumerate(header_cells):
-        text = cell.get_text(strip=True)
-        if i == 0:
-            # Первая колонка — "День недели"
-            continue
-        # Пропускаем колонки с "ПЕРЕРЫВ" и другие не-пары
-        if "ПЕРЕРЫВ" in text or "перерыв" in text:
-            pair_numbers.append("")
-            continue
-        # Извлекаем номер пары (может быть "1", "1 пара", "Пара 1", "4 пара (веч.)" и т.д.)
-        num_match = re.search(r"\d+", text)
-        if num_match:
-            pair_numbers.append(num_match.group())
-        else:
-            pair_numbers.append("")
-
-    # Пропускаем заголовок и служебные строки (типа временной строки)
-    # Начинаем со строки после заголовка
-    for tr in rows[header_row_idx + 1:]:
-        cells = tr.find_all(["th", "td"])
-        if len(cells) < 2:
-            continue
-
-        # Первая ячейка должна содержать день недели или время
-        day_cell = cells[0]
-        day_text = day_cell.get_text(strip=True)
-
-        # Проверяем, это ли день недели (исключаем временные строки вида "08:45-10:20")
-        if re.match(r"^\d{2}:\d{2}", day_text):
-            # Это временная строка, пропускаем
-            continue
-
-        weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс', 
-                    'Пн.', 'Вт.', 'Ср.', 'Чт.', 'Пт.', 'Сб.', 'Вс.',
-                    'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
-        if not any(w in day_text for w in weekdays):
-            continue
-
-        # Обрабатываем каждую пару в этом дне
-        for pair_idx, pair_cell in enumerate(cells[1:]):
-            if pair_idx >= len(pair_numbers):
-                break
-
-            pair_num = pair_numbers[pair_idx]
-            if not pair_num:
-                continue
-
-            raw = pair_cell.get_text(separator="\n")
-            lines = [s.strip() for s in raw.split("\n") if s.strip() and s.strip() != "&nbsp;"]
-
-            for line in lines:
-                if len(line) < 3:
-                    continue
-
+            if source.search_type == "teacher":
+                parsed = _parse_teacher_line(line, current_week, current_day, pair_num, source)
+                if parsed:
+                    lessons.append(parsed)
+            else:
                 ok, clean = _strip_week_range(line, current_week)
                 if not ok:
                     continue
                 line = clean
 
-                # Формат для групп: Дисциплина(Л|П|лаб|сем) Преподаватель место
                 m = re.search(r"\((Л|П|лаб|сем)\)\s+(.+)$", line)
-                if m:
-                    lesson_type = m.group(1)
-                    rest = line[: m.start()].strip()
-                    discipline = re.sub(r"^\d+(?:\s*-\s*\d+)?(?:\s*\(\d+\))?\s+", "", rest).strip()
-                    if not discipline:
-                        discipline = rest
-                else:
-                    # Формат для преподавателей: Группы; Код; Аудитория(Тип)
-                    # Пример: н31-31;34-34; БТБ-25-03*1;  а- 228(П);
-                    m = re.search(r"(\d+[а-яА-Я]*)\s*\(([ЛПлсаб]+)\)\s*;", line)
-                    if m:
-                        # Это может быть комната с типом
-                        lesson_type = m.group(2)
-                        # Пытаемся найти дисциплину в коде (паттерн вроде БТБ-25-03)
-                        code_match = re.search(r"[А-Яа-я]{2,4}-\d{2}-\d{2}", line)
-                        if code_match:
-                            discipline = code_match.group().strip()
-                        else:
-                            # Если нет кода, используем всю строку до комнаты
-                            before_room = re.sub(r"\d+\([А-Яа-я]*\).*$", "", line).strip()
-                            discipline = before_room if before_room else "Неизвестная дисциплина"
-                    else:
-                        # Не в ожидаемом формате
-                        continue
-                
+                if not m:
+                    continue
+                lesson_type = m.group(1)
+                rest = line[: m.start()].strip()
+                discipline = re.sub(r"^\d+(?:\s*-\s*\d+)?(?:\s*\(\d+\))?\s+", "", rest).strip()
+                if not discipline:
+                    discipline = rest
+
+                after_type = m.group(2).strip()
+                parts = after_type.split()
+                auditorium = "онлайн"
+                if parts and re.match(r"[а-яА-Я]?-?\d+[ -]?\d*", parts[-1]):
+                    auditorium = parts[-1]
+
                 lessons.append(
                     Lesson(
-                        date=day_text,
+                        date=current_day,
                         pair=pair_num,
                         discipline=discipline,
                         type=lesson_type,
                         owner=source.query,
                         priority=source.priority,
+                        auditorium=auditorium,
                     )
                 )
-    
+
     return lessons
 
 
+def _parse_horizontal_schedule(table, source: Source, current_week: int | None):
+    lessons = []
+    rows = table.find_all("tr")
+    if not rows:
+        return lessons
 
-def fetch_schedule(source: Source, save_debug_html: bool = True):
-    logs = []
-    
-    # Для преподавателей на kid/vak используем GET (проще и надёжнее)
-    if source.search_type == "teacher" and (source.kid or source.vak):
-        logs.append(f"Преподаватель {source.query}: kid={source.kid}, vak={source.vak}")
-        try:
-            # Используем GET с правильно составленным URL
-            url = build_url(source)
-            logs.append(f"Запрос: {url[:100]}...")
-            html, status = _fetch_page(url, source, use_post=False)
-            logs.append(f"Статус (GET): {status}")
-            
-            # Проверяем, есть ли расписание в HTML (таблица с "День недели")
-            if "День недели" in html:
-                soup = BeautifulSoup(html, "html.parser")
-                lessons = _parse_schedule_table(soup, source)
-                if lessons:
-                    logs.append(f"Расписание загружено успешно")
+    header_row_idx = -1
+    pair_numbers = []
+    break_col_indices = set()
+
+    for idx, row in enumerate(rows):
+        cells = row.find_all(["th", "td"])
+        if len(cells) < 10:
+            continue
+        if "День недели" in cells[0].get_text(strip=True):
+            header_row_idx = idx
+            for col_idx, cell in enumerate(cells[1:], 1):
+                text = cell.get_text(strip=True).upper()
+                if "ПЕРЕРЫВ" in text or "ПЕРЕ" in text:
+                    pair_numbers.append("")
+                    break_col_indices.add(col_idx)
                 else:
-                    logs.append("Таблица найдена но занятия не распарсены")
+                    m = re.search(r"\d+", text)
+                    pair_numbers.append(m.group() if m else "")
+            break
+
+    if header_row_idx == -1:
+        return lessons
+
+    for tr in rows[header_row_idx + 1:]:
+        cells = tr.find_all(["th", "td"])
+        if len(cells) < 2:
+            continue
+
+        day_text = cells[0].get_text(strip=True).strip()
+        if re.match(r"^\d{2}:\d{2}", day_text) or len(day_text) < 3:
+            continue
+        if not any(w in day_text for w in WEEKDAY_ORDER.keys()):
+            continue
+
+        for cell_idx, pair_cell in enumerate(cells[1:], 1):
+            if cell_idx in break_col_indices:
+                continue
+
+            if cell_idx - 1 >= len(pair_numbers):
+                break
+
+            pair_num = pair_numbers[cell_idx - 1]
+            if not pair_num or not pair_num.isdigit():
+                continue
+
+            raw_html = str(pair_cell)
+            parts = re.split(r"<br\s*/?>", raw_html)
+            for part in parts:
+                line = BeautifulSoup(part, "html.parser").get_text(" ", strip=True)
+                line = re.sub(r"\s+", " ", line).strip()
+                if len(line) < 8 or "nbsp" in line.lower():
+                    continue
+
+                parsed = _parse_teacher_line(line, current_week, day_text, pair_num, source)
+                if parsed:
+                    lessons.append(parsed)
+
+    return lessons
+
+
+def _parse_teacher_line(line: str, current_week: Optional[int], day: str, pair: str, source: Source) -> Optional[Lesson]:
+    line = line.strip()
+    if not line:
+        return None
+
+    line = re.sub(r"\s+", " ", line)
+
+    tokens = [t.strip() for t in re.split(r"[;\s]+", line) if t.strip()]
+
+    week_ranges = []
+    groups = []
+    lesson_type = ""
+    auditorium = "онлайн"
+    disc_code = ""
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        if re.match(r"^н?\d+-\d+$", tok):
+            m = re.match(r"^н?(\d+)-(\d+)$", tok)
+            if m:
+                week_ranges.append((int(m.group(1)), int(m.group(2))))
+            i += 1
+            continue
+
+        if re.search(r"[А-Яа-я]{2,5}-\d{2}-\d{2}(?:-\d)?\*\d+", tok):
+            groups.append(tok)
+            i += 1
+            continue
+
+        m = re.match(r"^([аa][ -]?(?:on[- ]line|\d+(?:-\d+)?))\s*(\d*)\s*\(([ЛПлабсем]+)\)$", tok, re.I)
+        if m:
+            aud = m.group(1).strip()
+            code = m.group(2).strip()
+            lt = m.group(3).upper()
+            lesson_type = lt
+            if "on" in aud.lower() or "line" in aud.lower():
+                auditorium = "онлайн"
             else:
-                logs.append("Ответ не содержит расписание (нет 'День недели')")
-                lessons = []
-        except Exception as e:
-            logs.append(f"Ошибка: {e}")
-            lessons = []
-            html = None
-    else:
-        # Для групп и преподавателей без kid/vak
-        url = build_url(source)
-        logs.append(f"Запрос: {url}")
+                auditorium = aud
+            if code:
+                disc_code = code
+            i += 1
+            continue
 
-        html = None
-        status = 0
+        m = re.match(r"^(\d+)\s*\(([ЛПлабсем]+)\)$", tok)
+        if m:
+            if not disc_code:
+                disc_code = m.group(1)
+            lesson_type = m.group(2).upper()
+            i += 1
+            continue
+
+        i += 1
+
+    if week_ranges and current_week is not None:
+        if not any(s <= current_week <= e for s, e in week_ranges):
+            return None
+
+    if not lesson_type:
+        return None
+
+    discipline = "Занятие"
+    if groups:
+        groups_str = ", ".join(sorted(set(groups)))
+        discipline = f"Занятие с группами {groups_str}"
+        if disc_code:
+            discipline += f" ({disc_code})"
+
+    return Lesson(
+        date=day,
+        pair=pair,
+        discipline=discipline,
+        type=lesson_type,
+        owner=source.query,
+        priority=source.priority,
+        groups=groups,
+        auditorium=auditorium,
+    )
+
+
+def fetch_schedule(source: Source):
+    if source.search_type == "teacher" and (source.kid or source.vak):
         try:
-            html, status = _fetch_page(url, source, use_post=False)
-            logs.append(f"Статус (GET): {status}")
-        except Exception as e:
-            logs.append(f"Ошибка GET: {e}")
-            html = None
+            url = build_url(source)
+            html_text, status = _fetch_page(url, source, use_post=False)
+            if "День недели" in html_text:
+                soup = BeautifulSoup(html_text, "html.parser")
+                lessons = _parse_schedule_table(soup, source)
+            else:
+                lessons = []
+        except Exception:
+            lessons = []
+            html_text = None
+    else:
+        url = build_url(source)
 
-        if html:
-            soup = BeautifulSoup(html, "html.parser")
+        html_text = None
+        try:
+            html_text, status = _fetch_page(url, source, use_post=False)
+        except Exception:
+            html_text = None
+
+        if html_text:
+            soup = BeautifulSoup(html_text, "html.parser")
             lessons = _parse_schedule_table(soup, source)
             if not lessons:
-                logs.append("По GET расписание не найдено, пробуем POST…")
                 try:
-                    html, status = _fetch_page(f"{BASE_URL}index.php", source, use_post=True)
-                    logs.append(f"Статус (POST): {status}")
-                    soup = BeautifulSoup(html, "html.parser")
+                    html_text, status = _fetch_page(f"{BASE_URL}index.php", source, use_post=True)
+                    soup = BeautifulSoup(html_text, "html.parser")
                     lessons = _parse_schedule_table(soup, source)
-                except Exception as e:
-                    logs.append(f"Ошибка POST: {e}")
+                except Exception:
+                    lessons = []
         else:
             lessons = []
 
-    if save_debug_html and html:
-        safe_name = re.sub(r'[<>:"/\\|?*]', "_", source.query)[:50]
-        with open(f"debug_{safe_name}.html", "w", encoding="utf-8") as f:
-            f.write(html)
-        logs.append("HTML сохранён в debug_*.html")
+    lessons = compact_consecutive_pairs(lessons)
+    return lessons
 
-    logs.append(f"Найдено занятий: {len(lessons)}")
-    return lessons, logs
 
-def merge_sources(sources):
-    result = {}
-    conflicts = {}
-    logs = []
+def compact_consecutive_pairs(lessons: List[Lesson]) -> List[Lesson]:
+    if not lessons:
+        return lessons
 
-    active = sorted(
-        [s for s in sources if s.enabled],
-        key=lambda s: s.priority,
-        reverse=True
+    lessons.sort(
+        key=lambda l: (
+            WEEKDAY_ORDER.get(l.date.strip(), 99),
+            int(l.pair.split("-")[0] if "-" in l.pair else l.pair or 999),
+        )
     )
 
-    if not active:
-        logs.append("⚠ Нет активных источников")
+    compacted = []
+    current = None
 
-    for source in active:
-        lessons, source_logs = fetch_schedule(source)
-        logs.extend(source_logs)
+    for lesson in lessons:
+        if current is not None:
+            same_day = current.date.strip() == lesson.date.strip()
+            same_disc = current.discipline == lesson.discipline
+            same_type = current.type == lesson.type
+            same_owner = current.owner == lesson.owner
+            same_groups = current.groups == lesson.groups
+            same_aud = current.auditorium == lesson.auditorium
+
+            prev_last = int(current.pair.split("-")[-1]) if "-" in current.pair else int(current.pair)
+            next_first = int(lesson.pair.split("-")[0]) if "-" in lesson.pair else int(lesson.pair)
+
+            consecutive = next_first == prev_last + 1
+
+            if same_day and same_disc and same_type and same_owner and same_groups and same_aud and consecutive:
+                if "-" in current.pair:
+                    start, _ = current.pair.split("-")
+                    current.pair = f"{start}-{lesson.pair}"
+                else:
+                    current.pair = f"{current.pair}-{lesson.pair}"
+                continue
+        if current is not None:
+            compacted.append(current)
+
+        current = lesson
+
+    if current is not None:
+        compacted.append(current)
+
+    return compacted
+
+
+def merge_sources(sources):
+    result: Dict[Tuple, Lesson] = {}
+    conflicts: Dict[Tuple, List[Lesson]] = {}
+
+    active = [s for s in sources if s.enabled]
+
+    if not active:
+        return [], {}
+
+    active_sorted = sorted(
+        active,
+        key=lambda s: (
+            -s.priority,
+            0 if s.search_type == "teacher" else 1,
+            s.name.lower(),
+        ),
+    )
+
+    for source in active_sorted:
+        lessons = fetch_schedule(source)
 
         for lesson in lessons:
-            # Для преподавателей не нужно сводить по дате/паре —
-            # иначе при одновременных занятиях разных преподавателей
-            # останется только первый источник (видимое поведение).
-            # Поэтому ключ для учителей включает владельца.
-            if source.search_type == "teacher":
-                key = (lesson.date, lesson.pair, lesson.owner)
-            else:
-                key = (lesson.date, lesson.pair)
+            key = (lesson.date, lesson.pair, lesson.owner) if source.search_type == "teacher" else (lesson.date, lesson.pair)
 
             if key not in result:
                 result[key] = lesson
@@ -549,18 +555,29 @@ def merge_sources(sources):
                     conflicts[key] = [result[key]]
                 conflicts[key].append(lesson)
 
-    return list(result.values()), conflicts, logs
+    final_lessons = list(result.values())
+
+    final_lessons.sort(
+        key=lambda l: (
+            WEEKDAY_ORDER.get(l.date.strip(), 99),
+            int(l.pair.split("-")[0]) if "-" in l.pair else int(l.pair or 99),
+        )
+    )
+
+    return final_lessons, conflicts
+
 
 class LoadThread(QThread):
-    finished_signal = Signal(list, dict, list)
+    finished_signal = Signal(list, dict)
 
     def __init__(self, sources):
         super().__init__()
         self.sources = sources
 
     def run(self):
-        lessons, conflicts, logs = merge_sources(self.sources)
-        self.finished_signal.emit(lessons, conflicts, logs)
+        lessons, conflicts = merge_sources(self.sources)
+        self.finished_signal.emit(lessons, conflicts)
+
 
 class ConflictDialog(QDialog):
     def __init__(self, conflicts):
@@ -572,15 +589,21 @@ class ConflictDialog(QDialog):
             layout.addWidget(QLabel("Конфликтов не найдено"))
         else:
             for key, lessons_list in conflicts.items():
-                # поддерживаем разные форматы ключа
                 date = key[0]
                 pair = key[1] if len(key) > 1 else "?"
                 owner_info = f" — {key[2]}" if len(key) > 2 else ""
                 layout.addWidget(QLabel(f"<b>{date} | Пара {pair}{owner_info}</b>"))
                 for lesson in lessons_list:
-                    layout.addWidget(QLabel(f"  • {lesson.discipline} ({lesson.type}) — {lesson.owner}"))
+                    groups_str = ", ".join(lesson.groups) if lesson.groups else ""
+                    aud_str = lesson.auditorium
+                    layout.addWidget(
+                        QLabel(
+                            f"  • {lesson.discipline} ({lesson.type}) — {lesson.owner} {groups_str} {aud_str}"
+                        )
+                    )
                 layout.addSpacing(10)
         self.setLayout(layout)
+
 
 class AddSourceDialog(QDialog):
     def __init__(self):
@@ -596,7 +619,6 @@ class AddSourceDialog(QDialog):
         self.priority_input = QSpinBox()
         self.priority_input.setRange(1, 100)
         self.priority_input.setValue(10)
-        self.priority_input.setToolTip("Больше — выше приоритет при конфликтах")
 
         layout.addRow("Название группы:", self.name_input)
         layout.addRow("Код группы:", self.query_input)
@@ -606,6 +628,7 @@ class AddSourceDialog(QDialog):
         btn.clicked.connect(self.accept)
         layout.addRow(btn)
         self.setLayout(layout)
+
     def get_source(self):
         return Source(
             name=self.name_input.text().strip() or self.query_input.text().strip(),
@@ -617,8 +640,6 @@ class AddSourceDialog(QDialog):
 
 
 class AddTeacherSourceDialog(QDialog):
-    """Добавление преподавателя через реальные списки с сайта (как в браузере)."""
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Добавить преподавателя")
@@ -628,12 +649,10 @@ class AddTeacherSourceDialog(QDialog):
 
         layout = QFormLayout(self)
 
-        # --- Филиал ---
         self.filial_box = QComboBox()
         self.filial_box.addItem("Уфа", 1)
         layout.addRow("Филиал:", self.filial_box)
 
-        # --- Кафедры ---
         self.kaf_box = QComboBox()
         self.kaf_box.setEnabled(False)
 
@@ -643,7 +662,6 @@ class AddTeacherSourceDialog(QDialog):
         layout.addRow(self.load_kaf_btn)
         layout.addRow("Кафедра:", self.kaf_box)
 
-        # --- Преподаватели ---
         self.teacher_box = QComboBox()
         self.teacher_box.setEnabled(False)
 
@@ -653,18 +671,14 @@ class AddTeacherSourceDialog(QDialog):
         layout.addRow(self.load_teacher_btn)
         layout.addRow("Преподаватель:", self.teacher_box)
 
-        # --- Приоритет ---
         self.priority_input = QSpinBox()
         self.priority_input.setRange(1, 100)
         self.priority_input.setValue(10)
         layout.addRow("Приоритет:", self.priority_input)
 
-        # --- Кнопка ---
         btn = QPushButton("Добавить")
         btn.clicked.connect(self.accept)
         layout.addRow(btn)
-
-    # --------------------------------------------------
 
     def _post_ajax(self, payload: str) -> str:
         headers = {
@@ -678,33 +692,31 @@ class AddTeacherSourceDialog(QDialog):
             "Host": "raspisanie.rusoil.net",
         }
 
-        # Попытка отправить как cp1251 (как в старых реалиях сайта), затем как utf-8.
-        # Сервер иногда возвращает неконсистентный HTML, поэтому пытаемся несколько вариантов.
-        last_exc = None
-        last_text = None
-        last_status = None
-        last_headers = None
-        last_raw = None
-
-        # Попытка получить стартовые куки/стейт как делает браузер
         try:
             SESSION.get(f"{BASE_URL}index.php", timeout=8)
         except Exception:
             pass
 
-        # Сначала попробуем отправить как строку (requests сам закодирует),
-        # затем как cp1251 и utf-8 (байты) — иногда сервер ожидает конкретную кодировку.
+        last_raw = None
+        last_status = None
+        last_headers = None
+        last_text = None
+        last_exc = None
+
         for enc in (None, "cp1251", "utf-8"):
             try:
                 if enc is None:
                     data_to_send = payload
                     hdrs = headers.copy()
-                    hdrs.pop("Content-Type", None)
                     hdrs["Content-Type"] = "application/x-www-form-urlencoded"
                 else:
                     data_to_send = payload.encode(enc, errors="ignore")
                     hdrs = headers.copy()
-                    hdrs["Content-Type"] = f"application/x-www-form-urlencoded; charset={ 'windows-1251' if enc=='cp1251' else 'utf-8' }"
+                    hdrs["Content-Type"] = (
+                        "application/x-www-form-urlencoded; charset=windows-1251"
+                        if enc == "cp1251"
+                        else "application/x-www-form-urlencoded; charset=utf-8"
+                    )
 
                 r = SESSION.post(
                     f"{BASE_URL}Ajaxm.php",
@@ -717,19 +729,18 @@ class AddTeacherSourceDialog(QDialog):
                 last_status = getattr(r, "status_code", None)
                 last_headers = dict(getattr(r, "headers", {}) or {})
                 text = _decode_ajax_html(r.content)
-                last_text = text
-                # Если в ответе есть ожидаемые маркеры или селект — считаем успехом
                 if ("start006" in text) or ("start008" in text) or ("<select" in text.lower()):
                     return text
+                last_text = text
             except Exception as e:
                 last_exc = e
 
-        # Если ответ пустой (например Content-Length: 0), попробуем сначала инициировать сессию ещё раз
         if last_raw is None or len(last_raw) == 0:
             try:
                 SESSION.get(f"{BASE_URL}index.php", timeout=8)
-                # Повторный POST (строка)
-                r = SESSION.post(f"{BASE_URL}Ajaxm.php", data=payload, headers=headers, timeout=15)
+                r = SESSION.post(
+                    f"{BASE_URL}Ajaxm.php", data=payload, headers=headers, timeout=15
+                )
                 last_raw = r.content
                 last_status = getattr(r, "status_code", None)
                 last_headers = dict(getattr(r, "headers", {}) or {})
@@ -737,44 +748,29 @@ class AddTeacherSourceDialog(QDialog):
             except Exception:
                 pass
 
-        # Если ни один вариант не дал ожидаемых маркеров, но есть последний текст —
-        # сохраним расширенную отладочную информацию и вернём текст для дальнейшей попытки парсинга.
         if last_text is not None:
-            # Если в ответе нет привычных маркеров, сохраним файлы для диагностики.
-            if not ("start006" in last_text or "start008" in last_text or "<select" in last_text.lower()):
-                try:
-                    with open("debug_ajax_response.html", "w", encoding="utf-8") as f:
-                        f.write(last_text or "")
-                    with open("debug_ajax_meta.txt", "w", encoding="utf-8") as f:
-                        f.write(f"status: {last_status}\n")
-                        f.write("headers:\n")
-                        for k, v in (last_headers or {}).items():
-                            f.write(f"{k}: {v}\n")
-                        f.write(f"raw_bytes: {len(last_raw) if last_raw is not None else 'None'}\n")
-                except Exception:
-                    pass
             return last_text
 
-        # Если ничего не получилось — попробуем финальный POST и пробросим исключение
         try:
-            r = SESSION.post(f"{BASE_URL}Ajaxm.php", data=payload.encode("utf-8", errors="ignore"), headers=headers, timeout=15)
+            r = SESSION.post(
+                f"{BASE_URL}Ajaxm.php",
+                data=payload.encode("utf-8", errors="ignore"),
+                headers=headers,
+                timeout=15,
+            )
             return _decode_ajax_html(r.content)
         except Exception:
             if last_exc:
                 raise last_exc
             raise
 
-    # --------------------------------------------------
-
     def load_kafedras(self):
-        """Получает список кафедр напрямую из HTML index.php и заполняет kaf_box."""
         self.kaf_box.clear()
         self.teacher_box.clear()
         self.teacher_box.setEnabled(False)
 
         filial = int(self.filial_box.currentData() or 1)
 
-        # Пытаемся загрузить страницу, на которой уже содержится select с кафедрами.
         try:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -788,46 +784,35 @@ class AddTeacherSourceDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось получить страницу с кафедрами:\n{e}")
             return
-        # 🔥 DEBUG: сохраняем HTML
-        with open("debug_teachers.html", "w", encoding="utf-8") as f:
-            f.write(page_html)
+
         raw = html.unescape(page_html)
         soup = BeautifulSoup(raw, "html.parser")
-        # элемент, в который вставляется <select id="rfio" или блок slov_kafedr
         select = soup.find("select", id="rfio")
         if not select:
             select = soup.find("select", id=lambda v: v and "rfio" in v.lower())
         container = None
         if select and not select.find_all("option"):
-            # возможно select самозакрывается; возьмём опции из родительского контейнера
             container = select.parent
         if not select:
-            # окончательное усилие: просто любой <select> в контейнере slov_kafedr
             container = soup.find(id="slov_kafedr")
             if container:
                 select = container.find("select")
-        # если нашли контейнер, соберём options из него вместо select
         options = []
         if container:
             options = container.find_all("option")
         elif select:
             options = select.find_all("option")
         if not options:
-            try:
-                with open("debug_kafedr_response.html", "w", encoding="utf-8") as f:
-                    f.write(raw)
-            except Exception:
-                pass
-            QMessageBox.critical(self, "Ошибка", "Не удалось найти элемент с кафедрами на странице. Ответ записан в debug_kafedr_response.html")
+            QMessageBox.critical(
+                self,
+                "Ошибка",
+                "Не удалось найти элемент с кафедрами на странице.",
+            )
             return
-
         for opt in options:
             value = opt.get("value")
-            # use space separator so that newlines/<br> don't glue words together
             title = opt.get_text(separator=" ", strip=True)
-            # текст может оказаться в неправильной кодировке (declare UTF-8, но на деле cp1251 bytes)
             try:
-                # re-encode through latin1 to preserve raw bytes
                 title = title.encode("latin1").decode("cp1251")
             except Exception:
                 pass
@@ -843,10 +828,8 @@ class AddTeacherSourceDialog(QDialog):
             QMessageBox.warning(self, "Пусто", "Кафедры не найдены на странице.")
             return
         self.kaf_box.setEnabled(True)
-    # --------------------------------------------------
 
     def load_teachers(self):
-        """Получает список преподавателей для выбранной кафедры, используя index.php?kaf=..."""
         self.teacher_box.clear()
 
         if not self.kaf_box.currentData():
@@ -856,7 +839,6 @@ class AddTeacherSourceDialog(QDialog):
         filial = int(self.filial_box.currentData() or 1)
         kaf_id = int(self.kaf_box.currentData())
 
-        # Загрузим страницу для кафедры
         try:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -864,22 +846,19 @@ class AddTeacherSourceDialog(QDialog):
                 "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
                 "Referer": f"{BASE_URL}index.php",
             }
-            r = requests.get(f"{BASE_URL}index.php?kaf={kaf_id}&filial={filial}", headers=headers, timeout=15)
+            r = requests.get(
+                f"{BASE_URL}index.php?kaf={kaf_id}&filial={filial}", headers=headers, timeout=15
+            )
             r.raise_for_status()
             page_html = _decode_ajax_html(r.content)
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось получить страницу преподавателей:\n{e}")
             return
 
-        # 🔥 DEBUG: сохраняем HTML
-        with open("debug_teachers.html", "w", encoding="utf-8") as f:
-            f.write(page_html)
-
         raw = html.unescape(page_html)
         soup = BeautifulSoup(raw, "html.parser")
         select = soup.find("select", id="kadrvak")
         if not select:
-            # иногда id может отсутствовать, ищем любой <select> с opt value содержащим '@'
             candidates = soup.find_all("select")
             for cand in candidates:
                 opts = cand.find_all("option")
@@ -901,21 +880,15 @@ class AddTeacherSourceDialog(QDialog):
             QMessageBox.critical(self, "Ошибка", "Не удалось найти список преподавателей на странице.")
             return
 
-        # Обрабатываем каждую option — извлекаем по одному преподавателю.
         teachers_added = 0
         for opt in options:
             value = opt.get("value") or ""
-            # берем только прямой текст внутри тега (если есть вложения, они
-            # попадают в opt.contents и не учитываются) — это спасает при сломанной
-            # разметке, когда один <option> содержит всех потомков.
             fio_parts = [t for t in opt.contents if isinstance(t, str)]
             fio = "".join(fio_parts).strip()
             fio = fio.replace("\xa0", " ").strip()
 
-            # Если в одном option записано несколько фамилий, обрабатываем тоже.
-            # Пример: "Асеев С.О. Астафьева А.Д.".
             if value != "0" and fio and len(fio) > 3:
-                names = list(re.finditer(r'[А-Я][а-я]+ [А-Я]\.[А-Я]\.', fio))
+                names = list(re.finditer(r"[А-Я][а-я]+ [А-Я]\.[А-Я]\.", fio))
                 if len(names) > 1:
                     id_tokens = re.findall(r"\d+@\d+@", value)
                     if not id_tokens:
@@ -924,56 +897,51 @@ class AddTeacherSourceDialog(QDialog):
                         single_fio = m.group().strip()
                         if not single_fio:
                             continue
-                        # декодируем на всякий случай cp1251
                         try:
                             single_fio = single_fio.encode("latin1").decode("cp1251")
                         except Exception:
                             pass
                         tok = id_tokens[idx] if idx < len(id_tokens) else id_tokens[0]
-                        parts = tok.split("@")
-                        if len(parts) >= 2:
+                        parts_val = tok.split("@")
+                        if len(parts_val) >= 2:
                             try:
-                                vak_flag = int(parts[0])
-                                tid = int(parts[1])
+                                vak_flag = int(parts_val[0])
+                                tid = int(parts_val[1])
                                 self.teacher_box.addItem(single_fio, (vak_flag, tid))
                                 teachers_added += 1
                             except ValueError:
                                 pass
                     continue
-            
-            # Стандартная обработка одиночного ФИО
-            # Декодируем кодировку если нужно
+
             try:
                 fio = fio.encode("latin1").decode("cp1251")
             except Exception:
                 pass
-            
-            # Пропускаем пустые и служебные опции
+
             if value == "0" or not fio or len(fio) < 2:
                 continue
-            
-            # Парсим value в формате "flag@id"
-            parts = value.split("@")
-            if len(parts) < 2:
+
+            parts_val = value.split("@")
+            if len(parts_val) < 2:
                 continue
-            
+
             try:
-                vak_flag = int(parts[0])
-                tid = int(parts[1])
+                vak_flag = int(parts_val[0])
+                tid = int(parts_val[1])
             except ValueError:
                 continue
-            
-            # Добавляем только этого преподавателя
+
             self.teacher_box.addItem(fio, (vak_flag, tid))
             teachers_added += 1
 
         if self.teacher_box.count() == 0:
-            QMessageBox.critical(self, "Пусто", f"Преподаватели не найдены (обработано {teachers_added} опций). Смотрите debug_teachers.html.")
+            QMessageBox.critical(
+                self,
+                "Пусто",
+                f"Преподаватели не найдены (обработано {teachers_added} опций).",
+            )
             return
         self.teacher_box.setEnabled(True)
-
-
-    # --------------------------------------------------
 
     def accept(self):
         if not self.teacher_box.currentData():
@@ -1008,6 +976,7 @@ class AddTeacherSourceDialog(QDialog):
     def get_source(self) -> Optional[Source]:
         return self._result_source
 
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1037,7 +1006,6 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(self.schedule_tab)
 
         self.schedule_stack = QStackedWidget()
-        # Страница 0: расписание
         schedule_page = QWidget()
         schedule_layout = QVBoxLayout(schedule_page)
         self.load_btn = QPushButton("Поиск по списку источников")
@@ -1047,14 +1015,8 @@ class MainWindow(QMainWindow):
         self.list_widget = QListWidget()
         self.list_widget.setAlternatingRowColors(True)
         schedule_layout.addWidget(self.list_widget, stretch=1)
-        self.log_output = QTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setMaximumHeight(120)
-        schedule_layout.addWidget(QLabel("Статус:"))
-        schedule_layout.addWidget(self.log_output)
         self.schedule_stack.addWidget(schedule_page)
 
-        # Страница 1: конфликты (заменяет расписание по ТЗ [2.5])
         conflict_page = QWidget()
         conflict_layout = QVBoxLayout(conflict_page)
         self.conflict_back_btn = QPushButton("← Назад к расписанию")
@@ -1075,12 +1037,11 @@ class MainWindow(QMainWindow):
             return
         self.load_btn.setEnabled(False)
         self.load_btn.setText("Загрузка…")
-        self.log_output.clear()
         self.thread = LoadThread(self.sources)
         self.thread.finished_signal.connect(self.display_schedule)
         self.thread.start()
 
-    def display_schedule(self, lessons, conflicts, logs):
+    def display_schedule(self, lessons, conflicts):
         self.list_widget.clear()
         if lessons:
             def sort_key(lesson: Lesson):
@@ -1093,16 +1054,16 @@ class MainWindow(QMainWindow):
                 return (day_key, pair_num, lesson.discipline)
 
             for lesson in sorted(lessons, key=sort_key):
+                groups_str = ", ".join(lesson.groups) if lesson.groups else ""
+                aud_str = lesson.auditorium
+                dis_str = f"{lesson.discipline} " if lesson.discipline else ""
                 self.list_widget.addItem(
-                    f"{lesson.date} | Пара {lesson.pair} | {lesson.discipline} ({lesson.type}) — {lesson.owner}"
+                    f"{lesson.date} | Пара {lesson.pair} | {dis_str}({lesson.type}) {groups_str} {aud_str} — {lesson.owner}"
                 )
         else:
             self.list_widget.addItem("Занятия не найдены. Проверьте запросы и подключение.")
-        self.log_output.setPlainText("\n".join(logs))
-        self.log_output.moveCursor(QTextCursor.Start)
 
         if conflicts:
-            # По ТЗ [2.5]: окно конфликтов заменяет текущее функциональное окно
             container = self.conflict_scroll.widget()
             old_layout = container.layout()
             for i in reversed(range(old_layout.count())):
@@ -1110,13 +1071,18 @@ class MainWindow(QMainWindow):
                 if w:
                     w.deleteLater()
             for key, lessons_list in conflicts.items():
-                # ключ может быть (date, pair) или (date, pair, owner)
                 date = key[0]
                 pair = key[1] if len(key) > 1 else "?"
                 owner_info = f" — {key[2]}" if len(key) > 2 else ""
                 old_layout.addWidget(QLabel(f"<b>{date} | Пара {pair}{owner_info}</b>"))
                 for lesson in lessons_list:
-                    old_layout.addWidget(QLabel(f"  • {lesson.discipline} ({lesson.type}) — {lesson.owner}"))
+                    groups_str = ", ".join(lesson.groups) if lesson.groups else ""
+                    aud_str = lesson.auditorium
+                    old_layout.addWidget(
+                        QLabel(
+                            f"  • {lesson.discipline} ({lesson.type}) — {lesson.owner} {groups_str} {aud_str}"
+                        )
+                    )
                 old_layout.addSpacing(12)
             self.schedule_stack.setCurrentIndex(1)
         else:
@@ -1155,7 +1121,6 @@ class MainWindow(QMainWindow):
     def refresh_sources(self):
         self.sources_list.blockSignals(True)
         self.sources_list.clear()
-        # Отображение в порядке убывания приоритета (ТЗ [1.7])
         order = sorted(range(len(self.sources)), key=lambda i: (-self.sources[i].priority, i))
         for idx in order:
             s = self.sources[idx]
