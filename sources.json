@@ -1,34 +1,10 @@
 [
     {
-        "name": "БНИ-23-01",
-        "search_type": "group",
-        "query": "БНИ-23-01",
-        "priority": 10,
-        "enabled": true,
-        "filial": 1,
-        "kaf": null,
-        "kaf_name": "",
-        "kid": null,
-        "vak": null
-    },
-    {
         "name": "БНИ-22-01",
         "search_type": "group",
         "query": "БНИ-22-01",
-        "priority": 4,
-        "enabled": false,
-        "filial": 1,
-        "kaf": null,
-        "kaf_name": "",
-        "kid": null,
-        "vak": null
-    },
-    {
-        "name": "БИФ-22-01",
-        "search_type": "group",
-        "query": "БИФ-22-01",
-        "priority": 4,
-        "enabled": false,
+        "priority": 10,
+        "enabled": true,
         "filial": 1,
         "kaf": null,
         "kaf_name": "",
@@ -45,6 +21,18 @@
         "kaf": 84,
         "kaf_name": "ИТМ",
         "kid": 28981,
+        "vak": null
+    },
+    {
+        "name": "Аглиуллин А.Р. (ИТМ)",
+        "search_type": "teacher",
+        "query": "Аглиуллин А.Р.",
+        "priority": 10,
+        "enabled": false,
+        "filial": 1,
+        "kaf": 84,
+        "kaf_name": "ИТМ",
+        "kid": 28517,
         "vak": null
     }
 ]

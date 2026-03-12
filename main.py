@@ -15,8 +15,10 @@ from PySide6.QtWidgets import (
     QComboBox, QSpinBox, QMessageBox,
     QDialog, QFormLayout, QStackedWidget,
     QScrollArea, QFrame,
+    QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PySide6.QtCore import Qt, QThread, Signal
+from datetime import date, timedelta
 
 SOURCES_FILE = "sources.json"
 BASE_URL = "https://raspisanie.rusoil.net/rasp_old/"
@@ -61,6 +63,7 @@ class Lesson:
     priority: int
     groups: List[str] = field(default_factory=list)
     auditorium: str = "онлайн"
+    week: int | None = None
 
 
 @dataclass
@@ -121,7 +124,7 @@ def _decode_schedule_html(raw: bytes) -> str:
     for enc in ("utf-8", "cp1251"):
         try:
             text = raw.decode(enc)
-            if "День недели" in text or "расписан" in text.lower():
+            if "День недели" in text or "расписание" in text.lower():
                 return text
         except (UnicodeDecodeError, LookupError):
             continue
@@ -285,6 +288,7 @@ def _parse_vertical_schedule(table, source: Source, current_week: int | None):
                         owner=source.query,
                         priority=source.priority,
                         auditorium=auditorium,
+                        week=current_week,
                     )
                 )
 
@@ -362,70 +366,71 @@ def _parse_teacher_line(line: str, current_week: Optional[int], day: str, pair: 
     if not line:
         return None
 
-    line = re.sub(r"\s+", " ", line)
+    line = re.sub(r'\s+', ' ', line)
 
-    tokens = [t.strip() for t in re.split(r"[;\s]+", line) if t.strip()]
+    parts = [p.strip() for p in line.split(';') if p.strip()]
 
+    if len(parts) < 2:
+        return None
+
+    # Недели
     week_ranges = []
-    groups = []
-    lesson_type = ""
-    auditorium = "онлайн"
-    disc_code = ""
-
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-
-        if re.match(r"^н?\d+-\d+$", tok):
-            m = re.match(r"^н?(\d+)-(\d+)$", tok)
-            if m:
-                week_ranges.append((int(m.group(1)), int(m.group(2))))
-            i += 1
-            continue
-
-        if re.search(r"[А-Яа-я]{2,5}-\d{2}-\d{2}(?:-\d)?\*\d+", tok):
-            groups.append(tok)
-            i += 1
-            continue
-
-        m = re.match(r"^([аa][ -]?(?:on[- ]line|\d+(?:-\d+)?))\s*(\d*)\s*\(([ЛПлабсем]+)\)$", tok, re.I)
+    if len(parts) > 0 and (parts[0].startswith('н') or re.match(r'^\d+-\d+$', parts[0])):
+        m = re.match(r'^н?(\d+-\d+)$', parts[0])
         if m:
-            aud = m.group(1).strip()
-            code = m.group(2).strip()
-            lt = m.group(3).upper()
-            lesson_type = lt
-            if "on" in aud.lower() or "line" in aud.lower():
-                auditorium = "онлайн"
-            else:
-                auditorium = aud
-            if code:
-                disc_code = code
-            i += 1
-            continue
-
-        m = re.match(r"^(\d+)\s*\(([ЛПлабсем]+)\)$", tok)
-        if m:
-            if not disc_code:
-                disc_code = m.group(1)
-            lesson_type = m.group(2).upper()
-            i += 1
-            continue
-
-        i += 1
+            start, end = map(int, m.group(1).split('-'))
+            week_ranges.append((start, end))
 
     if week_ranges and current_week is not None:
         if not any(s <= current_week <= e for s, e in week_ranges):
             return None
 
-    if not lesson_type:
+    # Группы
+    groups_set = set()
+    for part in parts:
+        for m in re.finditer(r'([А-Яа-я]{2,}-\d{2}-\d{2}(?:-\d)?)', part):
+            g = m.group(1)
+            cleaned = re.sub(r'^\d+|\*.*$', '', g).strip(' -*')
+            if cleaned and len(cleaned) >= 6:
+                groups_set.add(cleaned)
+
+    # Тип
+    lesson_type = "?"
+    for part in parts:
+        m = re.search(r'\(([А-Яа-яЁёA-Za-z?]{1,6})\)', part, re.I)
+        if m:
+            lesson_type = m.group(1).upper()
+            break
+
+    # Аудитория
+    auditorium = "онлайн"
+    for part in parts[2:]:
+        clean = re.sub(r'\d{4,6}|\([А-Яа-я]+\)', '', part).strip()
+        if clean:
+            if any(w in clean.lower() for w in ['онлайн', 'online', 'a-on-line', 'дист']):
+                auditorium = "онлайн"
+            else:
+                m_aud = re.search(r'([а-яА-Я]?-?\d+(?:-\d+)?)', clean)
+                if m_aud:
+                    auditorium = m_aud.group(1)
+                    break
+
+    # Discipline — здесь критический блок
+    discipline = ""
+    if groups_set:
+        group_str = ", ".join(sorted(groups_set))
+        discipline = group_str
+        if lesson_type != "?":
+            discipline += f" ({lesson_type})"
+
+    if not discipline:
         return None
 
-    discipline = "Занятие"
-    if groups:
-        groups_str = ", ".join(sorted(set(groups)))
-        discipline = f"Занятие с группами {groups_str}"
-        if disc_code:
-            discipline += f" ({disc_code})"
+    # Для отладки (убери после теста)
+    print("RAW line:", line)
+    print("Groups set:", groups_set)
+    print("Final discipline:", discipline)
+    print("---")
 
     return Lesson(
         date=day,
@@ -434,10 +439,10 @@ def _parse_teacher_line(line: str, current_week: Optional[int], day: str, pair: 
         type=lesson_type,
         owner=source.query,
         priority=source.priority,
-        groups=groups,
+        groups=list(groups_set),
         auditorium=auditorium,
+        week=current_week,
     )
-
 
 def fetch_schedule(source: Source):
     if source.search_type == "teacher" and (source.kid or source.vak):
@@ -507,12 +512,14 @@ def compact_consecutive_pairs(lessons: List[Lesson]) -> List[Lesson]:
             consecutive = next_first == prev_last + 1
 
             if same_day and same_disc and same_type and same_owner and same_groups and same_aud and consecutive:
+                # Сливаем пары, но НЕ дублируем discipline
                 if "-" in current.pair:
                     start, _ = current.pair.split("-")
                     current.pair = f"{start}-{lesson.pair}"
                 else:
                     current.pair = f"{current.pair}-{lesson.pair}"
                 continue
+
         if current is not None:
             compacted.append(current)
 
@@ -980,10 +987,12 @@ class AddTeacherSourceDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+
         self.setWindowTitle("Расписание — raspisanie.rusoil.net")
-        self.resize(1000, 700)
+        self.resize(1100, 700)
 
         self.sources = load_sources()
+
         if not self.sources:
             self.sources = [
                 Source("БНИ-22-01", "group", "БНИ-22-01", 10, True),
@@ -996,115 +1005,246 @@ class MainWindow(QMainWindow):
 
         self.schedule_tab = QWidget()
         self.sources_tab = QWidget()
+
         self.tabs.addTab(self.schedule_tab, "Расписание")
         self.tabs.addTab(self.sources_tab, "Источники")
 
         self.init_schedule_tab()
         self.init_sources_tab()
 
+    # --------------------------------------------------
+
+    def get_lesson_date(self, week_number, weekday):
+
+        if week_number is None:
+            return ""
+
+        today = date.today()
+
+        year = today.year
+        if today.month < 9:
+            year -= 1
+
+        start = date(year, 9, 1)
+
+        weekday_index = WEEKDAY_ORDER.get(weekday.strip(), None)
+
+        if weekday_index is None:
+            return ""
+
+        delta_days = (week_number - 1) * 7 + (weekday_index - 1)
+
+        lesson_date = start + timedelta(days=delta_days)
+
+        return lesson_date.strftime("%d.%m")
+
+    # --------------------------------------------------
+
     def init_schedule_tab(self):
+
         layout = QVBoxLayout(self.schedule_tab)
 
         self.schedule_stack = QStackedWidget()
+
         schedule_page = QWidget()
         schedule_layout = QVBoxLayout(schedule_page)
+
         self.load_btn = QPushButton("Поиск по списку источников")
         self.load_btn.clicked.connect(self.load_schedule)
+
         schedule_layout.addWidget(self.load_btn)
-        schedule_layout.addWidget(QLabel("Дата и день недели | № пары | дисциплина (форма)"))
-        self.list_widget = QListWidget()
-        self.list_widget.setAlternatingRowColors(True)
-        schedule_layout.addWidget(self.list_widget, stretch=1)
+
+        self.table = QTableWidget()
+
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            "Дата",
+            "День",
+            "Пара",
+            "Дисциплина",
+            "Аудитория",
+            "Источник"
+        ])
+
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+
+        schedule_layout.addWidget(self.table, stretch=1)
+
         self.schedule_stack.addWidget(schedule_page)
 
+        # страница конфликтов
         conflict_page = QWidget()
         conflict_layout = QVBoxLayout(conflict_page)
+
         self.conflict_back_btn = QPushButton("← Назад к расписанию")
-        self.conflict_back_btn.clicked.connect(lambda: self.schedule_stack.setCurrentIndex(0))
+        self.conflict_back_btn.clicked.connect(
+            lambda: self.schedule_stack.setCurrentIndex(0)
+        )
+
         conflict_layout.addWidget(self.conflict_back_btn)
+
         self.conflict_scroll = QScrollArea()
         self.conflict_scroll.setWidgetResizable(True)
-        self.conflict_scroll.setWidget(QFrame())
-        self.conflict_scroll.widget().setLayout(QVBoxLayout())
+
+        self.conflict_container = QFrame()
+        self.conflict_container.setLayout(QVBoxLayout())
+
+        self.conflict_scroll.setWidget(self.conflict_container)
+
         conflict_layout.addWidget(self.conflict_scroll)
+
         self.schedule_stack.addWidget(conflict_page)
 
         layout.addWidget(self.schedule_stack)
 
+    # --------------------------------------------------
+
     def load_schedule(self):
+
         if not any(s.enabled for s in self.sources):
-            QMessageBox.warning(self, "Ошибка", "Включите хотя бы один источник в списке источников.")
+            QMessageBox.warning(
+                self,
+                "Ошибка",
+                "Включите хотя бы один источник."
+            )
             return
+
         self.load_btn.setEnabled(False)
         self.load_btn.setText("Загрузка…")
+
         self.thread = LoadThread(self.sources)
         self.thread.finished_signal.connect(self.display_schedule)
         self.thread.start()
 
+    # --------------------------------------------------
+
     def display_schedule(self, lessons, conflicts):
-        self.list_widget.clear()
-        if lessons:
-            def sort_key(lesson: Lesson):
+
+        self.table.setRowCount(0)
+
+        if not lessons:
+
+            self.table.setRowCount(1)
+            self.table.setItem(0, 0, QTableWidgetItem("Занятия не найдены"))
+
+        else:
+
+            def sort_key(lesson):
+
                 day = (lesson.date or "").strip()
+
                 day_key = WEEKDAY_ORDER.get(day, 99)
+
                 try:
-                    pair_num = int(lesson.pair)
-                except (TypeError, ValueError):
+                    pair_num = int(
+                        lesson.pair.split("-")[0]
+                        if "-" in lesson.pair
+                        else lesson.pair or 999
+                    )
+                except:
                     pair_num = 99
+
                 return (day_key, pair_num, lesson.discipline)
 
             for lesson in sorted(lessons, key=sort_key):
-                groups_str = ", ".join(lesson.groups) if lesson.groups else ""
-                aud_str = lesson.auditorium
-                dis_str = f"{lesson.discipline} " if lesson.discipline else ""
-                self.list_widget.addItem(
-                    f"{lesson.date} | Пара {lesson.pair} | {dis_str}({lesson.type}) {groups_str} {aud_str} — {lesson.owner}"
-                )
-        else:
-            self.list_widget.addItem("Занятия не найдены. Проверьте запросы и подключение.")
+
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+
+                discipline = lesson.discipline.strip() if lesson.discipline else "(занятие)"
+
+                aud = lesson.auditorium.strip() if lesson.auditorium else "онлайн"
+
+                if aud.lower() in ["online", "a-on-line", ""]:
+                    aud = "онлайн"
+
+                week = getattr(lesson, "week", None)
+
+                lesson_date = self.get_lesson_date(week, lesson.date)
+
+                self.table.setItem(row, 0, QTableWidgetItem(lesson_date))
+                self.table.setItem(row, 1, QTableWidgetItem(lesson.date))
+                self.table.setItem(row, 2, QTableWidgetItem(f"Пара {lesson.pair}"))
+                self.table.setItem(row, 3, QTableWidgetItem(discipline))
+                self.table.setItem(row, 4, QTableWidgetItem(aud))
+                self.table.setItem(row, 5, QTableWidgetItem(lesson.owner))
+
+        # ---------- конфликты ----------
 
         if conflicts:
-            container = self.conflict_scroll.widget()
-            old_layout = container.layout()
-            for i in reversed(range(old_layout.count())):
-                w = old_layout.takeAt(i).widget()
-                if w:
-                    w.deleteLater()
+
+            layout = self.conflict_container.layout()
+
+            while layout.count():
+
+                item = layout.takeAt(0)
+
+                if item.widget():
+                    item.widget().deleteLater()
+
             for key, lessons_list in conflicts.items():
+
                 date = key[0]
                 pair = key[1] if len(key) > 1 else "?"
+
                 owner_info = f" — {key[2]}" if len(key) > 2 else ""
-                old_layout.addWidget(QLabel(f"<b>{date} | Пара {pair}{owner_info}</b>"))
+
+                layout.addWidget(
+                    QLabel(f"<b>{date} | Пара {pair}{owner_info}</b>")
+                )
+
                 for lesson in lessons_list:
-                    groups_str = ", ".join(lesson.groups) if lesson.groups else ""
-                    aud_str = lesson.auditorium
-                    old_layout.addWidget(
+
+                    aud_str = (
+                        lesson.auditorium
+                        if lesson.auditorium != "онлайн"
+                        else "онлайн"
+                    )
+
+                    layout.addWidget(
                         QLabel(
-                            f"  • {lesson.discipline} ({lesson.type}) — {lesson.owner} {groups_str} {aud_str}"
+                            f"  • {lesson.discipline} — {lesson.owner} {aud_str}"
                         )
                     )
-                old_layout.addSpacing(12)
+
+                layout.addSpacing(12)
+
             self.schedule_stack.setCurrentIndex(1)
+
         else:
             self.schedule_stack.setCurrentIndex(0)
 
         self.load_btn.setEnabled(True)
         self.load_btn.setText("Поиск по списку источников")
 
+    # --------------------------------------------------
+
     def init_sources_tab(self):
+
         layout = QVBoxLayout(self.sources_tab)
+
         sources_layout = QHBoxLayout()
+
         self.sources_list = QListWidget()
         self.sources_list.itemChanged.connect(self.on_source_changed)
+
         sources_layout.addWidget(self.sources_list, stretch=2)
 
         btn_layout = QVBoxLayout()
+
         add_group_btn = QPushButton("Добавить группу")
         add_group_btn.clicked.connect(self.add_group_source)
+
         add_teacher_btn = QPushButton("Добавить преподавателя")
         add_teacher_btn.clicked.connect(self.add_teacher_source)
+
         del_btn = QPushButton("Удалить")
         del_btn.clicked.connect(self.delete_source)
+
         save_btn = QPushButton("Сохранить")
         save_btn.clicked.connect(lambda: save_sources(self.sources))
 
@@ -1115,67 +1255,114 @@ class MainWindow(QMainWindow):
         btn_layout.addStretch()
 
         sources_layout.addLayout(btn_layout)
+
         layout.addLayout(sources_layout)
+
         self.refresh_sources()
 
+    # --------------------------------------------------
+
     def refresh_sources(self):
+
         self.sources_list.blockSignals(True)
         self.sources_list.clear()
-        order = sorted(range(len(self.sources)), key=lambda i: (-self.sources[i].priority, i))
+
+        order = sorted(
+            range(len(self.sources)),
+            key=lambda i: (-self.sources[i].priority, i),
+        )
+
         for idx in order:
+
             s = self.sources[idx]
+
             item = QListWidgetItem(
-                f"{s.name} | {'Группа' if s.search_type == 'group' else 'Преподаватель'} | приоритет {s.priority}"
+                f"{s.name} | "
+                f"{'Группа' if s.search_type == 'group' else 'Преподаватель'} | "
+                f"приоритет {s.priority}"
             )
+
             item.setCheckState(Qt.Checked if s.enabled else Qt.Unchecked)
             item.setData(Qt.UserRole, idx)
+
             self.sources_list.addItem(item)
+
         self.sources_list.blockSignals(False)
 
+    # --------------------------------------------------
+
     def add_group_source(self):
+
         dlg = AddSourceDialog()
+
         if dlg.exec() == QDialog.DialogCode.Accepted:
+
             new_source = dlg.get_source()
+
             if new_source and new_source.query:
+
                 self.sources.append(new_source)
+
                 save_sources(self.sources)
+
                 self.refresh_sources()
+
+    # --------------------------------------------------
 
     def add_teacher_source(self):
+
         dlg = AddTeacherSourceDialog()
+
         if dlg.exec() == QDialog.DialogCode.Accepted:
+
             new_source = dlg.get_source()
+
             if new_source is not None:
+
                 self.sources.append(new_source)
+
                 save_sources(self.sources)
+
                 self.refresh_sources()
+
+    # --------------------------------------------------
 
     def on_source_changed(self, item):
+
         idx = item.data(Qt.UserRole)
+
         if isinstance(idx, int) and 0 <= idx < len(self.sources):
+
             self.sources[idx].enabled = item.checkState() == Qt.Checked
+
             save_sources(self.sources)
 
-    def add_source(self):
-        dlg = AddSourceDialog()
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_source = dlg.get_source()
-            if new_source.query:
-                self.sources.append(new_source)
-                save_sources(self.sources)
-                self.refresh_sources()
+    # --------------------------------------------------
 
     def delete_source(self):
+
         item = self.sources_list.currentItem()
+
         if item is None:
             return
+
         idx = item.data(Qt.UserRole)
+
         if not isinstance(idx, int) or idx < 0 or idx >= len(self.sources):
             return
-        reply = QMessageBox.question(self, "Подтверждение", "Удалить этот источник?")
+
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение",
+            "Удалить этот источник?"
+        )
+
         if reply == QMessageBox.StandardButton.Yes:
+
             self.sources.pop(idx)
+
             save_sources(self.sources)
+
             self.refresh_sources()
 
 
